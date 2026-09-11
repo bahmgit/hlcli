@@ -1,0 +1,17 @@
+/target/
+/.idea/
+/.vscode/
+.DS_Store
+.env
+.env.*
+!.env.example
+hl-v2.json
+wallet_profiles.json
+credentials.bin
+salt.bin
+keybinds.json
+runtime/
+wallets/
+*.log
+*.key
+*.pem

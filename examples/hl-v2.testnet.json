@@ -1,0 +1,10 @@
+{
+  "network": "Testnet",
+  "defaultSymbol": "BTC",
+  "allowedSymbols": ["BTC"],
+  "symbolAliases": {},
+  "bind": "127.0.0.1:8088",
+  "allowRemote": false,
+  "requiredAccountMode": "any",
+  "marketCrossBps": 50
+}

@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+session="hl-grid"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+hl="$root/target/release/hl"
+window="$session:markets"
+
+command -v tmux >/dev/null 2>&1 || {
+  echo "tmux is required" >&2
+  exit 1
+}
+[[ -x "$hl" ]] || {
+  echo "missing $hl; run cargo build --release --bins" >&2
+  exit 1
+}
+if tmux has-session -t "=$session" 2>/dev/null; then
+  echo "tmux session $session already exists; attach with: tmux attach -t $session" >&2
+  exit 1
+fi
+
+native_markets=()
+builder_markets=()
+spot_markets=()
+while IFS= read -r market; do
+  case "$market" in
+    SPOT:*) spot_markets+=("$market") ;;
+    *:*) builder_markets+=("$market") ;;
+    ?*) native_markets+=("$market") ;;
+  esac
+done < <("$hl" markets | awk 'NF {print $1}')
+markets=("${native_markets[@]}" "${builder_markets[@]}" "${spot_markets[@]}")
+(( ${#markets[@]} > 0 )) || {
+  echo "daemon returned no allowed markets" >&2
+  exit 1
+}
+
+# Prove the daemon supports scoped sessions before creating any tmux state.
+"$hl" --market "${markets[0]}" status >/dev/null
+
+tmux new-session -d -s "$session" -n markets -c "$root"
+setup_complete=0
+cleanup() {
+  if (( setup_complete == 0 )); then
+    tmux kill-session -t "=$session" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+tmux set-environment -t "=$session" HL_GRID_BIN "$hl"
+first_pane="$(tmux display-message -p -t "$window.0" '#{pane_id}')"
+printf -v pane_command 'exec "$HL_GRID_BIN" --market %q' "${markets[0]}"
+tmux respawn-pane -k -t "$first_pane" "$pane_command"
+tmux select-pane -t "$first_pane" -T "${markets[0]}"
+
+last_pane="$first_pane"
+for market in "${markets[@]:1}"; do
+  printf -v pane_command 'exec "$HL_GRID_BIN" --market %q' "$market"
+  pane="$(tmux split-window -d -P -F '#{pane_id}' -t "$last_pane" -c "$root" "$pane_command")"
+  tmux select-pane -t "$pane" -T "$market"
+  last_pane="$pane"
+  tmux select-layout -t "$window" tiled >/dev/null
+done
+
+tmux set-option -w -t "$window" pane-border-status top
+tmux set-option -w -t "$window" pane-border-format ' #{pane_title} '
+tmux select-layout -t "$window" tiled >/dev/null
+setup_complete=1
+
+if [[ -n "${TMUX:-}" ]]; then
+  tmux switch-client -t "=$session"
+else
+  tmux attach-session -t "=$session"
+fi
