@@ -23,6 +23,8 @@ fn executable_families_produce_their_exact_action_class() {
     let now = now_ms();
     managed.apply_resting_receipt(
         Order {
+            fast_cancel_eligible: false,
+            trailing: None,
             symbol: "BTC".to_string(),
             oid: 1,
             cloid: Some("0x00000000000000000000000000000001".to_string()),
@@ -38,6 +40,8 @@ fn executable_families_produce_their_exact_action_class() {
     );
     managed.apply_resting_receipt(
         Order {
+            fast_cancel_eligible: false,
+            trailing: None,
             symbol: "BTC".to_string(),
             oid: 2,
             cloid: Some("0x00000000000000000000000000000002".to_string()),
@@ -54,6 +58,7 @@ fn executable_families_produce_their_exact_action_class() {
     managed.apply_twap(
         7,
         Twap {
+            details: None,
             symbol: "BTC".to_string(),
             dex: String::new(),
             is_buy: true,

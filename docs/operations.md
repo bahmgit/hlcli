@@ -39,6 +39,8 @@ loading. Unknown keys are currently ignored: use the exact field names below and
 
 The shipped example allows only BTC on testnet; it is not loaded unless copied to the data directory.
 Without a file or overrides, startup uses mainnet with an unrestricted market universe.
+With a nonempty allowlist, discovery queries builder metadata only for DEX prefixes named in it.
+An empty allowlist discovers every DEX.
 Aliases are canonicalized to uppercase and never become exchange symbols. Use `hl markets`
 to discover exact canonical native, builder (`BUILDER:ASSET`), and spot (`SPOT:BASE/QUOTE`) symbols.
 
@@ -70,7 +72,9 @@ target/release/hld --testnet --read-only --user 0x000000000000000000000000000000
 Read-only mode requires no private key and rejects actions before signing. Check `hl doctor` for
 diagnostics and `hl health` for a machine-readable check (nonzero exit when unhealthy). Wait for
 readiness before trading. `Ctrl-C` stops a foreground daemon; exchange orders may remain active.
-Managed work requires the daemon to run and reconciles on restart.
+Chases and unfinished attached entries require the daemon to run and reconcile on restart. Native
+trailing orders and conditional TWAPs continue on Hyperliquid while the daemon is offline. Startup
+reconciles native trails across configured DEXs without a local active-trail database.
 
 Hyperliquid nonces are signer-scoped. Do not share one API key across signing processes or reuse
 deregistered API-wallet keys; see the official
@@ -100,6 +104,16 @@ GET routes: `/v1/health`, `/v1/capabilities`, `/v1/status`, `/v1/portfolio`, `/v
 `x-hl-v2-token: <token>`. Remote bind requires both `allowRemote` and a token. Prefer loopback or
 a private authenticated tunnel; HTTP itself has no TLS. Filter markets with `?kind=all|perps|hip3|spot`
 and paginate commands with `?after=<id>&limit=<n>`. HTTP does not submit commands.
+
+## Upgrading from local trailing
+
+Managed-state schema v3 removes local trailing monitors. Startup refuses v1/v2 state containing an
+active local trail or an unfinished trailing attachment. Before upgrading, use the previous binary
+to cancel/drain those entry and protection orders and verify exchange state. Do not delete the
+managed file or journal to bypass this check. Safe nontrailing v2 work (chases and fixed attached
+protection) is retained; v1 unfinished attachments remain unsupported because they lack safe identity.
+The daemon does not automatically convert local trails: conversion would reset watermarks or open
+a protection gap. Place a new native trail explicitly after draining old work.
 
 ## Recovery and troubleshooting
 

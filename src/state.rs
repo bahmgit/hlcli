@@ -267,6 +267,8 @@ pub struct Twap {
     pub reduce_only: bool,
     pub randomize: bool,
     pub submitted_ms: Option<u64>,
+    #[serde(default)]
+    pub details: Option<crate::protocol::TwapDetails>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +281,10 @@ pub enum OrderKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Order {
+    #[serde(default)]
+    pub fast_cancel_eligible: bool,
+    #[serde(default)]
+    pub trailing: Option<NativeTrailing>,
     pub symbol: String,
     pub oid: u64,
     pub cloid: Option<String>,
@@ -288,6 +294,13 @@ pub struct Order {
     pub reduce_only: bool,
     pub kind: OrderKind,
     pub tif: Option<TimeInForce>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeTrailing {
+    pub retracement: crate::protocol::Retracement,
+    pub activation: Option<Decimal>,
+    pub best: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,10 +361,14 @@ pub struct TradingState {
     pub borrow_lend: BTreeMap<u64, Fresh<BorrowLend>>,
     pub balance_summary: Option<Fresh<BalanceSummary>>,
     pub spot_capacity_ms: Option<Fresh<()>>,
+    #[serde(default)]
+    pub mark_prices: BTreeMap<String, Fresh<Decimal>>,
     pub active_assets: BTreeMap<String, Fresh<ActiveAssetData>>,
     pub account_mode: Option<Fresh<AccountMode>>,
     pub required_account_mode: Option<AccountMode>,
     pub recent_fills: VecDeque<Fill>,
+    #[serde(default)]
+    pub recovered_trailing_placements: BTreeMap<String, Option<u64>>,
     #[serde(default)]
     pub recovered_order_outcomes: BTreeMap<String, RecoveredOrderOutcome>,
     pub fill_session_start_ms: u64,
@@ -377,10 +394,12 @@ impl TradingState {
             borrow_lend: BTreeMap::new(),
             balance_summary: None,
             spot_capacity_ms: None,
+            mark_prices: BTreeMap::new(),
             active_assets: BTreeMap::new(),
             account_mode: None,
             required_account_mode: None,
             recent_fills: VecDeque::new(),
+            recovered_trailing_placements: BTreeMap::new(),
             recovered_order_outcomes: BTreeMap::new(),
             fill_session_start_ms: 0,
             position_floor_ms: BTreeMap::new(),
@@ -403,6 +422,7 @@ impl TradingState {
             self.book.remove(&symbol);
             self.positions.remove(&symbol);
             self.active_assets.remove(&symbol);
+            self.mark_prices.remove(&symbol);
             self.position_floor_ms.remove(&symbol);
             self.order_floor_ms.remove(&symbol);
             self.orders.retain(|_, order| order.value.symbol != symbol);
@@ -487,6 +507,14 @@ impl TradingState {
         local_ms: u64,
         exchange_ms: Option<u64>,
     ) {
+        self.mark_prices.insert(
+            symbol.to_string(),
+            Fresh {
+                value: data.mark_price,
+                local_ms,
+                exchange_ms,
+            },
+        );
         self.active_assets.insert(
             symbol.to_string(),
             Fresh {

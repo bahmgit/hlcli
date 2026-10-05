@@ -189,6 +189,9 @@ fn market_subscriptions(
             .get(symbol)
             .ok_or_else(|| anyhow::anyhow!("unknown watched market {symbol}"))?;
         subscriptions.push(json!({ "type": "l2Book", "coin": market.wire_symbol }));
+        if market.kind == MarketKind::Spot {
+            subscriptions.push(json!({ "type": "activeAssetCtx", "coin": market.wire_symbol }));
+        }
         if market.kind != MarketKind::Spot
             && let Some(user) = user
         {
@@ -265,6 +268,7 @@ async fn apply_ws_message_for(
             | "allMids"
             | "openOrders"
             | "activeAssetData"
+            | "activeSpotAssetCtx"
             | "twapStates"
             | "userFills"
     ) {
@@ -311,6 +315,34 @@ async fn apply_ws_message_for(
             let mut state = state.write().await;
             let symbols = watched.iter().map(String::as_str).collect::<Vec<_>>();
             apply_open_orders_for_symbols(&mut state, data, now, now, Some(dex), &symbols)?;
+        }
+        "activeSpotAssetCtx" => {
+            let coin = data
+                .get("coin")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("spot context missing coin"))?;
+            let mark = data
+                .pointer("/ctx/markPx")
+                .and_then(value_decimal)
+                .filter(|px| *px > Decimal::ZERO)
+                .ok_or_else(|| anyhow::anyhow!("spot context missing positive mark price"))?;
+            let mut state = state.write().await;
+            let symbol = canonical_symbol_for_coin(&state, coin);
+            anyhow::ensure!(
+                state
+                    .markets
+                    .get(&symbol)
+                    .is_some_and(|market| market.kind == MarketKind::Spot),
+                "spot context references unknown spot market"
+            );
+            state.mark_prices.insert(
+                symbol,
+                crate::state::Fresh {
+                    value: mark,
+                    local_ms: now,
+                    exchange_ms: Some(now),
+                },
+            );
         }
         "activeAssetData" => {
             ws_user_envelope(data, "activeAssetData", expected_user)?;
@@ -627,6 +659,7 @@ fn parse_twap_entry(
     Ok((
         id,
         Twap {
+            details: parse_twap_details(state)?,
             symbol: state
                 .get("coin")
                 .and_then(Value::as_str)
@@ -698,10 +731,122 @@ fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+fn parse_twap_details(state: &Value) -> anyhow::Result<Option<crate::protocol::TwapDetails>> {
+    let trigger = match state.get("trigger").filter(|value| !value.is_null()) {
+        Some(trigger) => {
+            let p = trigger
+                .get("px")
+                .and_then(value_decimal)
+                .filter(|px| *px > Decimal::ZERO)
+                .ok_or_else(|| anyhow::anyhow!("TWAP trigger missing positive px"))?;
+            let a = trigger
+                .get("above")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| anyhow::anyhow!("TWAP trigger missing above"))?;
+            Some(crate::protocol::TwapTrigger { p, a })
+        }
+        None => None,
+    };
+    let stop = match state.get("stopPx").filter(|value| !value.is_null()) {
+        Some(value) => Some(
+            value_decimal(value)
+                .filter(|px| *px > Decimal::ZERO)
+                .ok_or_else(|| anyhow::anyhow!("TWAP stopPx must be positive"))?
+                .normalize()
+                .to_string(),
+        ),
+        None => None,
+    };
+    Ok(if trigger.is_some() || stop.is_some() {
+        Some(crate::protocol::TwapDetails {
+            t: trigger,
+            s: stop,
+        })
+    } else {
+        None
+    })
+}
+
 #[cfg(test)]
 mod contract_tests {
     use super::*;
     use crate::protocol::AssetId;
+
+    #[tokio::test]
+    async fn conditional_twap_state_transitions_follow_exchange_trigger_removal() {
+        let state = Arc::new(RwLock::new(TradingState::new("BTC")));
+        let mut payload = json!({"dex":"","states":[[42,{"coin":"BTC","side":"B","sz":"0.1","executedSz":"0","minutes":30,"reduceOnly":false,"randomize":false,"timestamp":100,"trigger":{"px":"50000","above":false},"stopPx":"51000"}]]});
+        apply_twap_states(&state, &payload, 100).await.unwrap();
+        let waiting = state.read().await.twaps.get(&42).unwrap().value.clone();
+        assert_eq!(
+            waiting.details.as_ref().unwrap().t.as_ref().unwrap().p,
+            "50000".parse().unwrap()
+        );
+        assert!(!waiting.details.as_ref().unwrap().t.as_ref().unwrap().a);
+        payload["states"][0][1]["trigger"] = Value::Null;
+        payload["states"][0][1]["executedSz"] = json!("0.01");
+        apply_twap_states(&state, &payload, 101).await.unwrap();
+        let running = state.read().await.twaps.get(&42).unwrap().value.clone();
+        assert!(running.details.as_ref().unwrap().t.is_none());
+        assert_eq!(
+            running.details.as_ref().unwrap().s.as_deref(),
+            Some("51000")
+        );
+        payload["states"] = json!([]);
+        apply_twap_states(&state, &payload, 102).await.unwrap();
+        assert!(state.read().await.twaps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spot_context_provides_fresh_mark_and_rejects_malformed_updates() {
+        let mut initial = TradingState::new("SPOT:HYPE/USDC");
+        initial.set_market(crate::state::Market {
+            symbol: "SPOT:HYPE/USDC".into(),
+            wire_symbol: "@1".into(),
+            dex: None,
+            asset: AssetId::spot(1),
+            kind: MarketKind::Spot,
+            size_decimals: 2,
+            max_leverage: None,
+            delisted: false,
+            open_interest_cap: false,
+        });
+        let watched = BTreeSet::from([initial.active.clone()]);
+        assert!(
+            market_subscriptions(&initial, &watched, None)
+                .unwrap()
+                .contains(&json!({"type":"activeAssetCtx","coin":"@1"}))
+        );
+        let state = Arc::new(RwLock::new(initial));
+        apply_ws_message_for(
+            &state,
+            &json!({"channel":"activeSpotAssetCtx","data":{"coin":"@1","ctx":{"markPx":"30.5"}}})
+                .to_string(),
+            None,
+            &watched,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.read().await.mark_prices["SPOT:HYPE/USDC"].value,
+            "30.5".parse().unwrap()
+        );
+        assert!(
+            apply_ws_message_for(
+                &state,
+                &json!({"channel":"activeSpotAssetCtx","data":{"coin":"@1","ctx":{"markPx":"0"}}})
+                    .to_string(),
+                None,
+                &watched
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            state.read().await.mark_prices["SPOT:HYPE/USDC"].value,
+            "30.5".parse().unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn user_fill_identity_is_required_and_recorded_atomically() {

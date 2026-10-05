@@ -157,6 +157,7 @@ pub enum Action {
     BatchModify(BatchModify),
     Cancel(BatchCancel),
     CancelByCloid(BatchCancelCloid),
+    TrailingStop(Box<TrailingStopAction>),
     TwapOrder(TwapOrderAction),
     TwapCancel(TwapCancelAction),
     UpdateLeverage(UpdateLeverageAction),
@@ -330,6 +331,8 @@ impl<'de> Deserialize<'de> for OrderTarget {
 #[serde(rename_all = "camelCase")]
 pub struct BatchCancel {
     pub cancels: Vec<Cancel>,
+    #[serde(rename = "f", default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -344,6 +347,8 @@ pub struct Cancel {
 #[serde(rename_all = "camelCase")]
 pub struct BatchCancelCloid {
     pub cancels: Vec<CancelByCloid>,
+    #[serde(rename = "f", default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -356,6 +361,40 @@ pub struct CancelByCloid {
 #[serde(rename_all = "camelCase")]
 pub struct TwapOrderAction {
     pub twap: TwapOrder,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Box<TwapDetails>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TrailingStopAction {
+    pub asset: u32,
+    pub is_buy: bool,
+    #[serde(rename = "sz", with = "wire_decimal")]
+    pub size: Decimal,
+    pub reduce_only: bool,
+    pub retracement: Retracement,
+    pub activation_px: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Retracement {
+    Pct(String),
+    Px(#[serde(with = "wire_decimal")] Decimal),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TwapDetails {
+    pub t: Option<TwapTrigger>,
+    pub s: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TwapTrigger {
+    #[serde(with = "wire_decimal")]
+    pub p: Decimal,
+    pub a: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

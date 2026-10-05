@@ -15,7 +15,8 @@ use crate::{
     protocol::{
         Action, AgentSetAbstraction, BatchCancel, BatchCancelCloid, BatchModify, BatchOrder,
         Cancel, CancelByCloid, Cloid, MarketKind, Modify, OrderGrouping, OrderRequest, OrderTarget,
-        OrderType, Side, Size, TimeInForce, TpSl, TwapCancelAction, TwapOrder, TwapOrderAction,
+        OrderType, Retracement, Side, Size, TimeInForce, TpSl, TrailingStopAction,
+        TwapCancelAction, TwapDetails, TwapOrder, TwapOrderAction, TwapTrigger,
         UpdateIsolatedMarginAction, UpdateLeverageAction,
     },
     state::{
@@ -73,6 +74,55 @@ impl ActionPlan {
                 .iter()
                 .map(|modify| &modify.order)
                 .try_for_each(validate),
+            Action::TrailingStop(action) => {
+                if action.asset != market.asset.0
+                    || !action.reduce_only
+                    || action.size <= Decimal::ZERO
+                    || action.size.normalize().scale() > market.size_decimals as u32
+                {
+                    return Err("native trailing requires the planned asset, positive lot-sized quantity, and reduce-only".into());
+                }
+                let retracement = match &action.retracement {
+                    Retracement::Pct(raw) => parse_retracement(raw)?,
+                    Retracement::Px(px) => parse_retracement(&px.to_string())?,
+                };
+                if let Retracement::Px(px) = retracement
+                    && !precision.accepts(px)
+                {
+                    return Err("invalid trailing distance precision".into());
+                }
+                if let Some(raw) = &action.activation_px
+                    && !precision.accepts(parse_decimal("trailing activation", raw)?)
+                {
+                    return Err("invalid trailing activation precision".into());
+                }
+                Ok(())
+            }
+            Action::TwapOrder(action) => {
+                if action.twap.asset != market.asset.0
+                    || !(5..=10_080).contains(&action.twap.minutes)
+                    || action.twap.size <= Decimal::ZERO
+                    || action.twap.size.normalize().scale() > market.size_decimals as u32
+                {
+                    return Err("invalid TWAP asset, duration, or lot-sized quantity".into());
+                }
+                if let Some(details) = &action.details {
+                    if details.t.is_none() && details.s.is_none() {
+                        return Err("empty TWAP details must be omitted".into());
+                    }
+                    if let Some(trigger) = &details.t
+                        && !precision.accepts(trigger.p)
+                    {
+                        return Err("invalid TWAP trigger precision".into());
+                    }
+                    if let Some(stop) = &details.s
+                        && !precision.accepts(parse_decimal("TWAP stop", stop)?)
+                    {
+                        return Err("invalid TWAP stop precision".into());
+                    }
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -107,7 +157,7 @@ impl Planner {
         symbol: &str,
         command: Command,
     ) -> Result<ActionPlan, String> {
-        let plan = match command {
+        let mut plan = match command {
             Command::Trade(trade) => self.trade(state, symbol, trade),
             Command::Scale(scale) => self.scale(state, symbol, scale),
             Command::BatchPlace(batch) => self.batch(state, symbol, batch),
@@ -150,6 +200,37 @@ impl Planner {
                 "command is not directly executable as an exchange action: {other:?}"
             )),
         }?;
+        match &mut plan.action {
+            Action::Cancel(batch) => {
+                batch.fast = !batch.cancels.is_empty()
+                    && batch.cancels.iter().all(|cancel| {
+                        state.orders_for(symbol).any(|order| {
+                            order.value.oid == cancel.oid
+                                && order.value.fast_cancel_eligible
+                                && state.orders_ready(
+                                    symbol,
+                                    now_ms(),
+                                    FreshnessLimits::default().orders_ms,
+                                )
+                        })
+                    })
+            }
+            Action::CancelByCloid(batch) => {
+                batch.fast = !batch.cancels.is_empty()
+                    && batch.cancels.iter().all(|cancel| {
+                        state.orders_for(symbol).any(|order| {
+                            order.value.cloid.as_deref() == Some(cancel.cloid.to_string().as_str())
+                                && order.value.fast_cancel_eligible
+                                && state.orders_ready(
+                                    symbol,
+                                    now_ms(),
+                                    FreshnessLimits::default().orders_ms,
+                                )
+                        })
+                    })
+            }
+            _ => {}
+        }
         validate_reduce_only_plan(state, &plan)?;
         Ok(plan)
     }
@@ -375,18 +456,60 @@ impl Planner {
         } else {
             Side::Bid
         };
-        let tpsl = match protection.kind {
-            ProtectionKind::StopLoss | ProtectionKind::TrailingStop => TpSl::Sl,
-            ProtectionKind::TakeProfit => TpSl::Tp,
-        };
-        let trigger_px = if protection.kind == ProtectionKind::TrailingStop {
-            PriceLevel {
-                value: trailing_trigger(state, symbol, side, &protection.value)?,
-                requires_book: true,
+        if protection.kind == ProtectionKind::TrailingStop {
+            let mark = fresh_mark(state, symbol)?;
+            let retracement = parse_retracement(&protection.value)?;
+            if let Retracement::Px(distance) = &retracement {
+                if !market.tick().accepts(*distance) {
+                    return Err("invalid trailing distance precision".into());
+                }
+                if side == Side::Ask && *distance >= mark {
+                    return Err(
+                        "trailing distance must be below mark price for a long position".into(),
+                    );
+                }
             }
+            let activation_px = protection
+                .activation
+                .as_deref()
+                .map(|raw| {
+                    let price = parse_decimal("trailing activation", raw)?;
+                    if !market.tick().accepts(price) {
+                        return Err("invalid trailing activation price precision".to_string());
+                    }
+                    Ok(price.normalize().to_string())
+                })
+                .transpose()?;
+            let size = protection_size(market, &position, protection.size, mark)?;
+            if size * mark < Decimal::from(10) {
+                return Err(
+                    "native trailing notional is below the 10 USDC exchange minimum".into(),
+                );
+            }
+            return Ok(ActionPlan {
+                kind: "protection",
+                market: symbol.into(),
+                action_label: "trailing_stop".into(),
+                requires_book: false,
+                action: Action::TrailingStop(Box::new(TrailingStopAction {
+                    asset: market.asset.0,
+                    is_buy: side == Side::Bid,
+                    size,
+                    reduce_only: true,
+                    retracement,
+                    activation_px,
+                })),
+            });
+        }
+        if protection.activation.is_some() {
+            return Err("activation is only supported for trailing stops".into());
+        }
+        let tpsl = if protection.kind == ProtectionKind::TakeProfit {
+            TpSl::Tp
         } else {
-            price_level(state, symbol, "trigger", &protection.value)?
+            TpSl::Sl
         };
+        let trigger_px = price_level(state, symbol, "trigger", &protection.value)?;
         let trigger_px = rounded_price(market, side, trigger_px.value, true)?;
         let reference = fresh_book(state, symbol)
             .map(|book| (book.bid + book.ask) / Decimal::TWO)
@@ -412,7 +535,8 @@ impl Planner {
         kind: ProtectionKind,
     ) -> Result<ActionPlan, String> {
         let target = match kind {
-            ProtectionKind::StopLoss | ProtectionKind::TrailingStop => OrderKind::StopLoss,
+            ProtectionKind::StopLoss => OrderKind::StopLoss,
+            ProtectionKind::TrailingStop => OrderKind::TrailingStop,
             ProtectionKind::TakeProfit => OrderKind::TakeProfit,
         };
         let market = market(state, symbol)?;
@@ -432,6 +556,7 @@ impl Planner {
                 action_label: "protection_cancel".to_string(),
                 requires_book: false,
                 action: Action::CancelByCloid(BatchCancelCloid {
+                    fast: false,
                     cancels: cloid_cancels,
                 }),
             });
@@ -442,6 +567,7 @@ impl Planner {
             action_label: "protection_cancel".to_string(),
             requires_book: false,
             action: Action::Cancel(BatchCancel {
+                fast: false,
                 cancels: orders
                     .into_iter()
                     .map(|order| Cancel {
@@ -504,6 +630,7 @@ impl Planner {
                 action_label: "cancel_all".to_string(),
                 requires_book: false,
                 action: Action::CancelByCloid(BatchCancelCloid {
+                    fast: false,
                     cancels: cloid_cancels,
                 }),
             });
@@ -514,6 +641,7 @@ impl Planner {
             action_label: "cancel_all".to_string(),
             requires_book: false,
             action: Action::Cancel(BatchCancel {
+                fast: false,
                 cancels: orders
                     .into_iter()
                     .map(|order| Cancel {
@@ -538,6 +666,7 @@ impl Planner {
             action_label: "cancel_oid".to_string(),
             requires_book: false,
             action: Action::Cancel(BatchCancel {
+                fast: false,
                 cancels: ids
                     .into_iter()
                     .map(|oid| Cancel {
@@ -571,7 +700,10 @@ impl Planner {
             market: symbol.to_string(),
             action_label: "cancel_cloid".to_string(),
             requires_book: false,
-            action: Action::CancelByCloid(BatchCancelCloid { cancels }),
+            action: Action::CancelByCloid(BatchCancelCloid {
+                cancels,
+                fast: false,
+            }),
         })
     }
 
@@ -631,6 +763,9 @@ impl Planner {
             .into_iter()
             .map(|target| {
                 let existing = find_order(state, symbol, &target)?;
+                if existing.kind == OrderKind::TrailingStop {
+                    return Err("native trailing orders cannot be moved or resized; cancel and place a new trail explicitly (resets watermark)".into());
+                }
                 let side = if existing.is_buy {
                     Side::Bid
                 } else {
@@ -766,6 +901,9 @@ impl Planner {
         symbol: &str,
         twap: TwapPlace,
     ) -> Result<ActionPlan, String> {
+        if !(5..=10_080).contains(&twap.minutes) {
+            return Err("TWAP duration must be 5..10080 minutes".into());
+        }
         let market = market(state, symbol)?;
         let side = side(twap.side);
         reject_spot_reduce_only(market, twap.reduce_only)?;
@@ -783,12 +921,55 @@ impl Planner {
                 "TWAP notional is below the 100 USDC exchange minimum after precision rounding: {notional}"
             ));
         }
+        let trigger = twap
+            .trigger
+            .as_ref()
+            .map(|(above, raw)| {
+                let p = parse_decimal("TWAP trigger", raw)?;
+                if !market.tick().accepts(p) {
+                    return Err("invalid TWAP trigger price precision".to_string());
+                }
+                Ok(TwapTrigger { p, a: *above })
+            })
+            .transpose()?;
+        let stop = twap
+            .stop
+            .as_ref()
+            .map(|raw| {
+                let stop = parse_decimal("TWAP stop", raw)?;
+                if !market.tick().accepts(stop) {
+                    return Err("invalid TWAP stop price precision".to_string());
+                }
+                let reference = match &trigger {
+                    Some(t) => t.p,
+                    None => fresh_mark(state, symbol)?,
+                };
+                if (side == Side::Bid && stop <= reference)
+                    || (side == Side::Ask && stop >= reference)
+                {
+                    return Err(
+                        "buy max must exceed trigger/current mark; sell min must be below it"
+                            .into(),
+                    );
+                }
+                Ok(stop.normalize().to_string())
+            })
+            .transpose()?;
+        let details = if trigger.is_some() || stop.is_some() {
+            Some(TwapDetails {
+                t: trigger,
+                s: stop,
+            })
+        } else {
+            None
+        };
         Ok(ActionPlan {
             kind: "twap",
             market: symbol.to_string(),
             action_label: "twap".to_string(),
             requires_book: true,
             action: Action::TwapOrder(TwapOrderAction {
+                details: details.map(Box::new),
                 twap: TwapOrder {
                     asset: market.asset.0,
                     is_buy: side == Side::Bid,
@@ -944,7 +1125,7 @@ fn reject_unsupported_trade_modifiers(
         return Err("Risk sizing is not supported with reduce-only".to_string());
     }
     if trade.trailing.is_some() {
-        return Err("trailing stop requires the managed trailing engine".to_string());
+        return Err("trailing stop requires deferred entry protection in hld".to_string());
     }
     if trade.chase.is_some() {
         return Err("trade chase modifier requires the managed chase engine".to_string());
@@ -988,7 +1169,9 @@ fn reject_unsupported_scale_modifiers(
         );
     }
     if scale.trailing.is_some() {
-        return Err("scale trailing attachment requires the managed trailing engine".to_string());
+        return Err(
+            "scale trailing attachment requires deferred entry protection in hld".to_string(),
+        );
     }
     Ok(())
 }
@@ -1081,7 +1264,10 @@ fn protection_size(
     Ok(size)
 }
 
-fn validate_reduce_only_plan(state: &TradingState, plan: &ActionPlan) -> Result<(), String> {
+pub(crate) fn validate_reduce_only_plan(
+    state: &TradingState,
+    plan: &ActionPlan,
+) -> Result<(), String> {
     let market = market(state, &plan.market)?;
     let (orders, aggregate) = match &plan.action {
         Action::Order(batch) if batch.grouping == OrderGrouping::NormalTpsl => {
@@ -1099,6 +1285,23 @@ fn validate_reduce_only_plan(state: &TradingState, plan: &ActionPlan) -> Result<
                 .collect::<Vec<_>>(),
             true,
         ),
+        Action::TrailingStop(action) => {
+            let mark = fresh_mark(state, &plan.market)?;
+            if let Retracement::Px(distance) = action.retracement
+                && !action.is_buy
+                && distance >= mark
+            {
+                return Err(
+                    "trailing distance must be below mark price for a long position".into(),
+                );
+            }
+            if action.size * mark < Decimal::from(10) {
+                return Err(
+                    "native trailing notional is below the 10 USDC exchange minimum".into(),
+                );
+            }
+            return validate_reduce_only_order(state, market, action.is_buy, action.size);
+        }
         Action::TwapOrder(action) if action.twap.reduce_only => {
             return validate_reduce_only_order(state, market, action.twap.is_buy, action.twap.size);
         }
@@ -1246,6 +1449,12 @@ fn request_from_order(
     price: Decimal,
     size: Decimal,
 ) -> Result<OrderRequest, String> {
+    let tpsl = match existing.kind {
+        OrderKind::TrailingStop => return Err("native trailing orders cannot be moved or resized; cancel and place a new trail explicitly (resets watermark)".into()),
+        OrderKind::StopLoss => Some(TpSl::Sl),
+        OrderKind::TakeProfit => Some(TpSl::Tp),
+        OrderKind::Limit => None,
+    };
     let side = if existing.is_buy {
         Side::Bid
     } else {
@@ -1260,22 +1469,17 @@ fn request_from_order(
         .transpose()
         .map_err(|err| err.to_string())?
         .unwrap_or_else(next_cloid);
-    let order_type = match existing.kind {
-        OrderKind::Limit => OrderType::Limit {
+    let order_type = match tpsl {
+        None => OrderType::Limit {
             tif: existing
                 .tif
                 .clone()
                 .ok_or_else(|| "cannot modify limit order with unknown tif".to_string())?,
         },
-        OrderKind::StopLoss | OrderKind::TrailingStop => OrderType::Trigger {
+        Some(tpsl) => OrderType::Trigger {
             is_market: true,
             trigger_px: price,
-            tpsl: TpSl::Sl,
-        },
-        OrderKind::TakeProfit => OrderType::Trigger {
-            is_market: true,
-            trigger_px: price,
-            tpsl: TpSl::Tp,
+            tpsl,
         },
     };
     Ok(OrderRequest {
@@ -1559,46 +1763,6 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-fn trailing_trigger(
-    state: &TradingState,
-    symbol: &str,
-    side: Side,
-    distance: &str,
-) -> Result<Decimal, String> {
-    let book = state
-        .book
-        .get(symbol)
-        .ok_or_else(|| "book unavailable for trailing stop".to_string())?
-        .value;
-    let mid = ((book.bid + book.ask) / Decimal::TWO).normalize();
-    let distance = trailing_distance(mid, distance)?;
-    let trigger = match side {
-        Side::Ask => mid - distance,
-        Side::Bid => mid + distance,
-    }
-    .normalize();
-    if trigger <= Decimal::ZERO {
-        return Err("trailing stop trigger must be positive".to_string());
-    }
-    Ok(trigger)
-}
-
-fn trailing_distance(reference: Decimal, raw: &str) -> Result<Decimal, String> {
-    if let Some(pct) = raw.strip_suffix('%') {
-        let pct = parse_decimal("trailing percent", pct.trim())?;
-        if pct <= Decimal::ZERO {
-            return Err("trailing percent must be positive".to_string());
-        }
-        Ok((reference * pct / Decimal::from(100)).normalize())
-    } else {
-        let distance = parse_decimal("trailing distance", raw)?;
-        if distance <= Decimal::ZERO {
-            return Err("trailing distance must be positive".to_string());
-        }
-        Ok(distance)
-    }
 }
 
 fn chase_target(
@@ -2126,4 +2290,32 @@ fn rounded_price(
         .round_for_side(side, price, conservative)
         .map(|price| price.normalize())
         .ok_or_else(|| format!("invalid price for {}", market.symbol))
+}
+
+pub(crate) fn parse_retracement(raw: &str) -> Result<Retracement, String> {
+    if let Some(raw) = raw.strip_suffix('%') {
+        let pct = parse_decimal("trailing percent", raw.trim())?;
+        if pct <= Decimal::ZERO || pct >= Decimal::from(100) || pct.normalize().scale() > 4 {
+            return Err("trailing percent must be greater than 0, below 100, and at most four decimal places".into());
+        }
+        Ok(Retracement::Pct(format!("{}%", pct.normalize())))
+    } else {
+        let px = parse_decimal("trailing distance", raw.trim_end_matches('$').trim())?;
+        if px <= Decimal::ZERO {
+            return Err("trailing distance must be positive".into());
+        }
+        Ok(Retracement::Px(px))
+    }
+}
+
+pub(crate) fn fresh_mark(state: &TradingState, symbol: &str) -> Result<Decimal, String> {
+    state
+        .mark_prices
+        .get(symbol)
+        .filter(|mark| {
+            mark.age_ms(now_ms()) <= FreshnessLimits::default().active_asset_ms
+                && mark.value > Decimal::ZERO
+        })
+        .map(|mark| mark.value)
+        .ok_or_else(|| format!("fresh mark price required for {symbol}"))
 }

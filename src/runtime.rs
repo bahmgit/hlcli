@@ -1356,6 +1356,32 @@ fn render_position(position: &Fresh<Position>, mark: Option<Decimal>) -> String 
 
 fn render_order(order: &Order, position: Option<&Position>, mark: Option<Decimal>) -> String {
     let side = if order.is_buy { "buy" } else { "sell" };
+    if order.kind == OrderKind::TrailingStop {
+        let mut line = format!(
+            "{} oid={} {} {} trail reduce",
+            order.symbol, order.oid, side, order.size
+        );
+        if let Some(trailing) = &order.trailing {
+            let retracement = match &trailing.retracement {
+                crate::protocol::Retracement::Pct(pct) => pct.clone(),
+                crate::protocol::Retracement::Px(px) => px.to_string(),
+            };
+            line.push_str(&format!(" retracement={retracement}"));
+            if let Some(px) = trailing.activation {
+                line.push_str(&format!(" activation={px}"));
+            }
+            if let Some(best) = trailing.best {
+                line.push_str(&format!(" best={best} trg={}", order.price));
+            } else {
+                line.push_str(if trailing.activation.is_some() {
+                    " waiting"
+                } else {
+                    " watermark=pending"
+                });
+            }
+        }
+        return line;
+    }
     let mut line = if order.kind == OrderKind::Limit {
         format!(
             "{} oid={} {} {} @ {}",
@@ -1437,10 +1463,28 @@ fn render_twap(id: u64, twap: &Twap) -> String {
     } else {
         Decimal::ZERO
     };
-    format!(
+    let mut line = format!(
         "{id}:{side} {}/{}({pct}%) {}m",
         twap.executed_size, twap.size, twap.minutes
-    )
+    );
+    if let Some(details) = &twap.details {
+        if let Some(trigger) = &details.t {
+            line.push_str(&format!(
+                " waiting trigger {} {}",
+                if trigger.a { "above" } else { "below" },
+                trigger.p
+            ));
+        } else {
+            line.push_str(" running");
+        }
+        if let Some(stop) = &details.s {
+            line.push_str(&format!(
+                " {} {stop}",
+                if twap.is_buy { "max" } else { "min" }
+            ));
+        }
+    }
+    line
 }
 
 fn mark_for(state: &TradingState, symbol: &str) -> Option<Decimal> {

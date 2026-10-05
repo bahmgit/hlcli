@@ -193,9 +193,13 @@ pub const COMMAND_DOCS: &[CommandDoc] = &[
             "trail 150",
             "trail set 0.4%",
             "trail 120 size 0.005",
+            "trail 1% size 50% activate 52000",
             "trail cancel",
         ],
-        notes: &["trailing stops ratchet one way only"],
+        notes: &[
+            "native trailing uses exchange mark-price watermarks and continues offline; generic move/resize is rejected",
+            "attached trailing adds independent native protection per owned fill increment",
+        ],
         usage_tokens: &["tp", "sl", "trail", "tsl"],
     },
     CommandDoc {
@@ -252,10 +256,15 @@ pub const COMMAND_DOCS: &[CommandDoc] = &[
         examples: &[
             "twap buy 0.1 over 30",
             "twap sell 0.2 over 10 reduce randomize",
+            "twap buy 0.1 over 30 trigger above 50000 max 51000",
+            "twap sell 0.1 over 30 trigger below 50000 min 49000",
             "twap cancel 12",
             "twap cancel all",
         ],
-        notes: &["use `status` to see active TWAP IDs"],
+        notes: &[
+            "use `status` to see active TWAP IDs and waiting/running conditions",
+            "trigger direction is explicit; buy accepts max, sell accepts min; Hyperliquid owns activation and stopping",
+        ],
         usage_tokens: &["twap"],
     },
     CommandDoc {

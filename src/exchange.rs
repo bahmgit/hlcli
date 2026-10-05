@@ -78,6 +78,9 @@ impl ExchangeResponse {
                 Action::Cancel(_) | Action::CancelByCloid(_),
                 Self::Ok(OkResponse::Cancel { statuses }),
             ) => Ok(statuses),
+            (Action::TrailingStop(_), Self::Ok(OkResponse::TrailingStop { oid })) if oid > 0 => {
+                Ok(vec![OrderStatus::Resting { oid, cloid: None }])
+            }
             (Action::TwapOrder(_), Self::Ok(OkResponse::TwapOrder { status })) => {
                 status.into_statuses()
             }
@@ -108,6 +111,7 @@ impl ExchangeResponse {
 pub enum OkResponse {
     Order { statuses: Vec<OrderStatus> },
     Cancel { statuses: Vec<OrderStatus> },
+    TrailingStop { oid: u64 },
     TwapOrder { status: TwapOrderStatus },
     TwapCancel { status: TwapCancelStatus },
     UpdateIsolatedMargin { status: ActionStatus },

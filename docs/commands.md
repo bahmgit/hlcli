@@ -69,6 +69,8 @@ batch resize 101,102 to 0.005
 close
 close 50% at +0.2%
 twap buy 0.1 over 30
+twap buy 0.1 over 30 trigger above 50000 max 51000
+twap sell 0.1 over 30 trigger below 50000 min 49000
 twap cancel all
 
 cancel
@@ -82,18 +84,50 @@ tp cancel
 sl cancel
 trail 150
 trail set 0.4%
+trail 1% size 50% activate 52000
 trail cancel
 chase buy 0.01 quote
 chase sell 100$ 0.2% tif alo post
 chase cancel
 ```
 
-Plain `cancel` skips TP/SL/trailing protection; cancel those explicitly. Trailing only ratchets
-favorably. Cancel an existing chase before replacing it. TP/SL/trailing and chase entry modifiers
-are described in command help. Attached protection starts from a fresh flat position and follows
-owned entry fills; it requires the daemon to remain running. Local validation rejects an invalid
-batch before submission, but exchange responses can contain per-item failures: always inspect them.
-TWAP duration is minutes; active IDs appear in `status`. Closing a shell does not cancel orders.
+Plain `cancel` skips TP/SL/trailing protection; cancel those explicitly. Eligible ordinary limit
+cancellation batches automatically request fast cancel. Mixed batches remain one ordinary action.
+Cancel an existing chase before replacing it. Chase cancellation disarms only protection attached
+to its own entry; independent protected entries retain their protection intent. Attached protection starts from a fresh flat position
+and follows owned entry fills; it requires the daemon to remain running until the entry finishes.
+Local validation rejects an invalid batch before submission, but exchange responses can contain
+per-item failures: always inspect them.
+
+`trail`/`tsl` places a native reduce-only position trailing stop. Native trailing requires at least
+10 USDC of notional after rounding, including full-position orders. An absolute retracement is a price
+distance; a percentage must be greater than zero and below 100, with at most four decimal places.
+Optional `activate <price>` defers tracking until Hyperliquid activates the order. Long trails track
+the highest mark; short trails track the lowest mark. `orders` displays activation, retracement,
+and the exchange watermark/current derived trigger, or a waiting state. Quote-denominated sizing
+uses the fresh mark price; percentage sizing uses the current position. There is no local fallback.
+Generic move/resize is rejected: cancel and place a new trail explicitly, which resets its watermark.
+`sl cancel` targets fixed stops; `trail cancel` targets native trails and disarms future attached
+trailing increments. Existing native trails continue while the daemon is offline.
+
+Attached trailing creates a separate native order for each newly protected owned fill increment;
+each has its own watermark. Earlier trails are never resized or recreated. If one tranche ends while an entry is still pending,
+the daemon cancels the remaining entry, retains surviving exits, and requests position reconciliation.
+It does not infer a fill from an order disappearing. Unavailable, stale, or conflicting position state
+also stops an unfinished trailing entry and retains its existing exits. If a later increment is
+below the exchange minimum or protection fails, existing protection remains, the remaining entry
+is canceled, and the daemon reports degraded protection. An unfilled owned entry missing from the order snapshot also triggers cancellation and explicit
+review rather than silently discarding its trailing attachment. Fills can still arrive while cancellation
+is in flight; review the resulting filled position explicitly.
+
+TWAP duration is 5..10080 minutes and minimum notional is 100 USDC after precision rounding.
+`trigger above|below <price>` is optional and its direction is independent of buy/sell. A buy TWAP
+accepts optional `max <price>`; a sell TWAP accepts `min <price>`. The stop must be above/below the
+trigger respectively, or above/below the fresh current mark when no trigger is specified. Prices
+must be positive and satisfy market precision. Conditions also work for supported spot markets;
+spot reduce-only remains invalid. Hyperliquid owns activation and stopping. Active IDs, conditions,
+and waiting/running state appear in `status`; cancel with `twap cancel <id|all>`. Unconditional TWAPs
+retain their original wire format. Closing a shell does not cancel exchange orders.
 
 ## Account and shell
 

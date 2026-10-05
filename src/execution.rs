@@ -36,6 +36,8 @@ pub struct JournalRecord {
     pub detail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<JournalContext>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statuses: Vec<OrderStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -202,7 +204,10 @@ impl TransportError {
     pub fn is_ambiguous(&self) -> bool {
         matches!(
             self,
-            Self::StreamClosed { .. } | Self::Timeout { .. } | Self::Decode(_)
+            Self::StreamClosed { .. }
+                | Self::Timeout { .. }
+                | Self::Decode(_)
+                | Self::Unexpected(_)
         )
     }
 }
@@ -460,6 +465,7 @@ impl ExecutionKernel {
             },
             reconciliation.detail,
             Some(&reconciliation.context),
+            &statuses,
         );
         SubmitReceipt {
             id: reconciliation.id,
@@ -512,7 +518,14 @@ impl ExecutionKernel {
             nonce,
             action_json,
         };
-        if let Err(err) = self.append(id, JournalPhase::Pending, meta, "pending", Some(&context)) {
+        if let Err(err) = self.append(
+            id,
+            JournalPhase::Pending,
+            meta,
+            "pending",
+            Some(&context),
+            &[],
+        ) {
             return SubmitReceipt {
                 id,
                 status: ExecutionStatus::Rejected,
@@ -560,7 +573,7 @@ impl ExecutionKernel {
                 };
                 let message = err.to_string();
                 let journal_error = self
-                    .append(id, phase, meta, &message, Some(&context))
+                    .append(id, phase, meta, &message, Some(&context), &[])
                     .err()
                     .map(|journal| format!("; journal_terminal: {journal}"))
                     .unwrap_or_default();
@@ -583,7 +596,7 @@ impl ExecutionKernel {
         statuses: Vec<OrderStatus>,
         context: Option<&JournalContext>,
     ) -> SubmitReceipt {
-        let append = self.append(id, phase, meta, detail, context);
+        let append = self.append(id, phase, meta, detail, context, &statuses);
         let status = match phase {
             JournalPhase::Accepted | JournalPhase::ReconciledAccepted => ExecutionStatus::Accepted,
             JournalPhase::Rejected | JournalPhase::Pending | JournalPhase::ReconciledRejected => {
@@ -606,6 +619,7 @@ impl ExecutionKernel {
         meta: SubmitMeta<'_>,
         detail: &str,
         context: Option<&JournalContext>,
+        statuses: &[OrderStatus],
     ) -> io::Result<()> {
         self.journal.append(&JournalRecord {
             id,
@@ -616,6 +630,7 @@ impl ExecutionKernel {
             action: meta.action.to_string(),
             detail: detail.to_string(),
             context: context.cloned(),
+            statuses: statuses.to_vec(),
         })
     }
 }

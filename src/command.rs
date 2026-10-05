@@ -221,6 +221,8 @@ pub struct Protection {
     pub kind: ProtectionKind,
     pub value: String,
     pub size: Option<String>,
+    #[serde(default)]
+    pub activation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,6 +256,10 @@ pub struct BatchLeg {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TwapPlace {
+    #[serde(default)]
+    pub trigger: Option<(bool, String)>,
+    #[serde(default)]
+    pub stop: Option<String>,
     pub side: Side,
     pub size: String,
     pub minutes: u64,
@@ -685,16 +691,51 @@ fn parse_twap(words: &[String]) -> Command {
     };
     let mut reduce_only = false;
     let mut randomize = false;
-    for token in &words[5..] {
-        match token.to_ascii_lowercase().as_str() {
+    let mut trigger = None;
+    let mut stop = None;
+    let mut i = 5;
+    while i < words.len() {
+        match words[i].to_ascii_lowercase().as_str() {
             "reduce" | "reduce-only" if !reduce_only => reduce_only = true,
             "randomize" | "randomise" if !randomize => randomize = true,
-            "reduce" | "reduce-only" => return reject("duplicate reduce-only modifier"),
-            "randomize" | "randomise" => return reject("duplicate randomize modifier"),
-            other => return reject(format!("unknown twap token '{other}'")),
+            "trigger" => {
+                if trigger.is_some() {
+                    return reject("duplicate TWAP trigger");
+                }
+                let above = if eq(words, i + 1, "above") {
+                    true
+                } else if eq(words, i + 1, "below") {
+                    false
+                } else {
+                    return reject("TWAP trigger requires above|below <price>");
+                };
+                let Some(price) = words.get(i + 2) else {
+                    return reject("TWAP trigger requires price");
+                };
+                trigger = Some((above, price.clone()));
+                i += 2;
+            }
+            "max" | "min" => {
+                if (eq(words, i, "max") && side != Side::Buy)
+                    || (eq(words, i, "min") && side != Side::Sell)
+                {
+                    return reject("buy TWAP accepts max; sell TWAP accepts min");
+                }
+                let Some(price) = words.get(i + 1) else {
+                    return reject("TWAP stop requires price");
+                };
+                if stop.replace(price.clone()).is_some() {
+                    return reject("duplicate TWAP stop");
+                }
+                i += 1;
+            }
+            other => return reject(format!("unknown or duplicate twap token '{other}'")),
         }
+        i += 1;
     }
     Command::TwapPlace(TwapPlace {
+        trigger,
+        stop,
         side,
         size: words[2].clone(),
         minutes,
@@ -795,16 +836,22 @@ fn parse_protection(words: &[String]) -> Command {
         return reject("protection command requires value");
     };
     let mut size = None;
+    let mut activation = None;
     let mut i = value_index + 1;
     while i < words.len() {
-        if !eq(words, i, "size") {
-            return reject(format!("unknown protection token '{}'", words[i]));
-        }
         let Some(raw) = words.get(i + 1) else {
-            return reject("size requires value");
+            return reject("protection modifier requires value");
         };
-        if size.replace(raw.clone()).is_some() {
-            return reject("duplicate protection size");
+        if eq(words, i, "size") {
+            if size.replace(raw.clone()).is_some() {
+                return reject("duplicate protection size");
+            }
+        } else if eq(words, i, "activate") && kind == ProtectionKind::TrailingStop {
+            if activation.replace(raw.clone()).is_some() {
+                return reject("duplicate trailing activation");
+            }
+        } else {
+            return reject(format!("unknown protection token '{}'", words[i]));
         }
         i += 2;
     }
@@ -812,6 +859,7 @@ fn parse_protection(words: &[String]) -> Command {
         kind,
         value: value.clone(),
         size,
+        activation,
     })
 }
 

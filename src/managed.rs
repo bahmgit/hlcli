@@ -23,7 +23,7 @@ use crate::{
     },
     protocol::{
         Action, BatchModify, Cloid, MarketKind, Modify, OrderRequest, OrderTarget, OrderType, Side,
-        TimeInForce, TpSl,
+        TimeInForce,
     },
     scope::ScopeRegistry,
     state::{FreshnessLimits, Market, Order, OrderKind, TradingState},
@@ -34,7 +34,6 @@ pub struct ManagedExecutor {
     inner: Arc<dyn PlanExecutor>,
     transition_lock: Mutex<()>,
     chases: Mutex<Vec<ActiveChase>>,
-    trailings: Mutex<Vec<ActiveTrailing>>,
     entry_protections: Mutex<Vec<EntryProtection>>,
     persistence: Option<ManagedPersistence>,
     persist_lock: Mutex<()>,
@@ -52,17 +51,6 @@ struct ActiveChase {
     cloid: Cloid,
     distance: ChaseDistance,
     tif: TimeInForce,
-    next_move_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ActiveTrailing {
-    symbol: String,
-    cloid: Cloid,
-    side: Side,
-    distance: TrailDistance,
-    trigger: Decimal,
     next_move_ms: u64,
 }
 
@@ -94,10 +82,20 @@ struct EntryOrder {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TrailingTranche {
+    operation: String,
+    size: Decimal,
+    oid: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ManagedProtectionLeg {
     value: String,
     cloid: Option<Cloid>,
     size: Decimal,
+    #[serde(default)]
+    tranches: Vec<TrailingTranche>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,32 +106,11 @@ enum ChaseDistance {
     Percent(Decimal),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum TrailDistance {
-    Absolute(Decimal),
-    Percent(Decimal),
-}
-
 enum PollResult {
     Keep,
     Disarm,
     Throttle { cloid: Cloid, next_move_ms: u64 },
     Moved { cloid: Cloid, next_move_ms: u64 },
-}
-
-enum TrailPollResult {
-    Keep,
-    Disarm,
-    Throttle {
-        cloid: Cloid,
-        next_move_ms: u64,
-    },
-    Moved {
-        cloid: Cloid,
-        trigger: Decimal,
-        next_move_ms: u64,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -147,7 +124,6 @@ struct ManagedPersistence {
 struct ManagedSnapshot {
     version: u8,
     chases: Vec<ActiveChase>,
-    trailings: Vec<ActiveTrailing>,
     entry_protections: Vec<EntryProtection>,
 }
 
@@ -215,7 +191,6 @@ impl ManagedExecutor {
             inner,
             transition_lock: Mutex::new(()),
             chases: Mutex::new(snapshot.chases),
-            trailings: Mutex::new(snapshot.trailings),
             entry_protections: Mutex::new(snapshot.entry_protections),
             persistence,
             persist_lock: Mutex::new(()),
@@ -234,9 +209,8 @@ impl ManagedExecutor {
         };
         let _guard = self.persist_lock.lock().await;
         let snapshot = ManagedSnapshot {
-            version: 2,
+            version: 3,
             chases: self.chases.lock().await.clone(),
-            trailings: self.trailings.lock().await.clone(),
             entry_protections: self.entry_protections.lock().await.clone(),
         };
         let data = serde_json::to_vec_pretty(&snapshot).map_err(|err| err.to_string())?;
@@ -261,7 +235,6 @@ impl ManagedExecutor {
             }
             self.poll_chases().await;
             self.poll_entry_protections().await;
-            self.poll_trailings().await;
         }
     }
 
@@ -516,7 +489,12 @@ impl ManagedExecutor {
                 .lock()
                 .await
                 .retain(|chase| !ids.contains(&chase.cloid.to_string()));
-            self.clear_all_pending(symbol).await;
+            self.entry_protections.lock().await.retain(|protection| {
+                !protection
+                    .entry_orders
+                    .iter()
+                    .any(|entry| ids.contains(&entry.cloid.to_string()))
+            });
             self.persist().await?;
         }
         Ok(receipt)
@@ -527,53 +505,18 @@ impl ManagedExecutor {
         symbol: &str,
         protection: Protection,
     ) -> Result<SubmitReceipt, String> {
-        let distance = parse_trail_distance(&protection.value)?;
-        let (plan, active) = {
+        {
             let state = self.state.read().await;
-            if self
-                .trailings
-                .lock()
-                .await
-                .iter()
-                .any(|active| active.symbol == symbol)
+            if state
+                .orders_for(symbol)
+                .any(|order| order.value.kind == OrderKind::TrailingStop)
             {
-                return Err("trailing stop already active; cancel it before replacing".to_string());
+                return Err("native trailing already active; cancel before replacing".into());
             }
-            let plan =
-                Planner::default().plan_for(&state, symbol, Command::ProtectionSet(protection))?;
-            let active = active_trailing_from_plan(symbol, &plan, distance, self.interval)?;
-            (plan, active)
-        };
-        let cloid = active.cloid;
-        self.trailings.lock().await.push(active);
-        if let Err(err) = self.persist().await {
-            self.trailings
-                .lock()
-                .await
-                .retain(|item| item.cloid != cloid);
-            return Err(err);
         }
-        let receipt = match self.inner.execute_plan(plan).await {
-            Ok(receipt) => receipt,
-            Err(err) => {
-                self.trailings
-                    .lock()
-                    .await
-                    .retain(|item| item.cloid != cloid);
-                self.persist().await?;
-                return Err(err);
-            }
-        };
-        if receipt.status == ExecutionStatus::Rejected {
-            self.trailings
-                .lock()
-                .await
-                .retain(|item| item.cloid != cloid);
-            self.persist().await?;
-        } else if accepted(&receipt) {
-            self.wake.notify_one();
-        }
-        Ok(receipt)
+        self.inner
+            .execute_command_for(symbol, Command::ProtectionSet(protection))
+            .await
     }
 
     async fn cancel_protection(
@@ -582,36 +525,16 @@ impl ManagedExecutor {
         kind: ProtectionKind,
     ) -> Result<SubmitReceipt, String> {
         let cleared_pending = self.clear_pending_protection(symbol, &kind).await?;
-        let trailing_cloids = self
-            .trailings
-            .lock()
-            .await
-            .iter()
-            .filter(|trailing| trailing.symbol == symbol)
-            .map(|trailing| trailing.cloid.to_string())
-            .collect::<std::collections::BTreeSet<_>>();
         let (cloids, oids) = {
             let state = self.state.read().await;
             let target = match kind {
-                ProtectionKind::StopLoss | ProtectionKind::TrailingStop => OrderKind::StopLoss,
+                ProtectionKind::StopLoss => OrderKind::StopLoss,
+                ProtectionKind::TrailingStop => OrderKind::TrailingStop,
                 ProtectionKind::TakeProfit => OrderKind::TakeProfit,
             };
             let orders = state
                 .orders_for(symbol)
-                .filter(|order| order.value.kind == target)
-                .filter(|order| match kind {
-                    ProtectionKind::TrailingStop => order
-                        .value
-                        .cloid
-                        .as_ref()
-                        .is_some_and(|cloid| trailing_cloids.contains(cloid)),
-                    ProtectionKind::StopLoss => order
-                        .value
-                        .cloid
-                        .as_ref()
-                        .is_none_or(|cloid| !trailing_cloids.contains(cloid)),
-                    ProtectionKind::TakeProfit => true,
-                });
+                .filter(|order| order.value.kind == target);
             let mut cloids = Vec::new();
             let mut oids = Vec::new();
             for order in orders {
@@ -629,13 +552,6 @@ impl ManagedExecutor {
             return Err("no matching protection orders".to_string());
         }
         let receipt = self.cancel_targets(symbol, cloids, oids).await?;
-        if accepted(&receipt) && kind == ProtectionKind::TrailingStop {
-            self.trailings
-                .lock()
-                .await
-                .retain(|trailing| trailing.symbol != symbol);
-            self.persist().await?;
-        }
         Ok(receipt)
     }
 
@@ -684,8 +600,32 @@ impl ManagedExecutor {
         }
     }
 
+    async fn validate_attached_trailing(&self, protection: &EntryProtection) -> Result<(), String> {
+        let Some(leg) = &protection.trailing else {
+            return Ok(());
+        };
+        let state = self.state.read().await;
+        let market = state
+            .markets
+            .get(&protection.symbol)
+            .ok_or_else(|| "unknown protection market".to_string())?;
+        let retracement = crate::planner::parse_retracement(&leg.value)?;
+        if let crate::protocol::Retracement::Px(distance) = retracement {
+            if !market.tick().accepts(distance) {
+                return Err("invalid trailing distance precision".into());
+            }
+            if protection.intended_is_buy
+                && distance >= crate::planner::fresh_mark(&state, &protection.symbol)?
+            {
+                return Err("trailing distance must be below mark price for a long entry".into());
+            }
+        }
+        Ok(())
+    }
+
     async fn store_pending_protection(&self, protection: EntryProtection) -> Result<(), String> {
         debug_assert!(!protection.is_empty());
+        self.validate_attached_trailing(&protection).await?;
         if self
             .entry_protections
             .lock()
@@ -708,6 +648,7 @@ impl ManagedExecutor {
         active: ActiveChase,
         protection: EntryProtection,
     ) -> Result<(), String> {
+        self.validate_attached_trailing(&protection).await?;
         let cloid = active.cloid;
         if self
             .entry_protections
@@ -774,13 +715,6 @@ impl ManagedExecutor {
         Ok(cleared)
     }
 
-    async fn clear_all_pending(&self, symbol: &str) {
-        self.entry_protections
-            .lock()
-            .await
-            .retain(|protection| protection.symbol != symbol);
-    }
-
     async fn remove_pending_protection(&self, id: Cloid) -> Result<(), String> {
         self.entry_protections
             .lock()
@@ -793,10 +727,45 @@ impl ManagedExecutor {
         &self,
         protection: &mut EntryProtection,
     ) -> Result<Option<SubmitReceipt>, String> {
-        let (target_size, entry_complete, protection_gone) =
-            self.refresh_entry_tracking(protection).await?;
+        let tracking = match self.refresh_entry_tracking(protection).await {
+            Ok(tracking) => tracking,
+            Err(err) => {
+                if protection.trailing.is_some() {
+                    protection.next_attempt_ms = u64::MAX;
+                    self.sync_pending_protection(protection).await?;
+                    if let Some(mut cancel) = self.cancel_remaining_entry_orders(protection).await?
+                        && !accepted(&cancel)
+                    {
+                        cancel.error = Some(format!(
+                            "degraded trailing protection: {err}; remaining entry cancellation failed: {}",
+                            receipt_error(&cancel)
+                        ));
+                        return Ok(Some(cancel));
+                    }
+                    return Err(format!(
+                        "degraded trailing protection: {err}; remaining entry canceled"
+                    ));
+                }
+                return Err(err);
+            }
+        };
+        let (target_size, entry_complete, protection_gone, trailing_gone) = tracking;
         self.sync_pending_protection(protection).await?;
-        if protection_gone {
+        if trailing_gone && target_size > Decimal::ZERO {
+            protection.next_attempt_ms = u64::MAX;
+            self.sync_pending_protection(protection).await?;
+            if let Some(mut cancel) = self.cancel_remaining_entry_orders(protection).await?
+                && !accepted(&cancel)
+            {
+                cancel.error = Some(format!(
+                    "native trailing tranche ended; surviving exits retained; remaining entry cancellation failed: {}",
+                    receipt_error(&cancel)
+                ));
+                return Ok(Some(cancel));
+            }
+            return Err("native trailing tranche ended while entry protection was pending; remaining entry canceled and surviving exits retained; reconcile the filled position".into());
+        }
+        if protection_gone || trailing_gone {
             return self.terminate_protected_entry(protection).await;
         }
         if target_size == Decimal::ZERO {
@@ -810,12 +779,44 @@ impl ManagedExecutor {
         let mut statuses = Vec::new();
         for kind in [
             ProtectionKind::StopLoss,
-            ProtectionKind::TakeProfit,
             ProtectionKind::TrailingStop,
+            ProtectionKind::TakeProfit,
         ] {
             let Some(leg) = protection.leg(&kind).cloned() else {
                 continue;
             };
+            if kind == ProtectionKind::TrailingStop {
+                if leg.size >= target_size {
+                    continue;
+                }
+                let placement = self.place_trailing_increment(protection, target_size).await;
+                match placement {
+                    Ok(receipt) if accepted(&receipt) => {
+                        statuses.extend(receipt.statuses);
+                    }
+                    Ok(receipt) => {
+                        protection.next_attempt_ms = u64::MAX;
+                        self.sync_pending_protection(protection).await?;
+                        if receipt.status != ExecutionStatus::Ambiguous
+                            && let Some(cancel) =
+                                self.cancel_remaining_entry_orders(protection).await?
+                        {
+                            statuses.extend(cancel.statuses);
+                        }
+                        statuses.extend(receipt.statuses.clone());
+                        return Ok(Some(self.aggregate_protection_receipt(&receipt, statuses)));
+                    }
+                    Err(err) => {
+                        protection.next_attempt_ms = u64::MAX;
+                        self.sync_pending_protection(protection).await?;
+                        self.cancel_remaining_entry_orders(protection).await?;
+                        return Err(format!(
+                            "degraded trailing protection: {err}; remaining entry cancellation requested"
+                        ));
+                    }
+                }
+                continue;
+            }
             let receipt = if let Some(cloid) = leg.cloid {
                 if leg.size == target_size {
                     continue;
@@ -829,16 +830,6 @@ impl ManagedExecutor {
                         },
                     )
                     .await?
-            } else if kind == ProtectionKind::TrailingStop {
-                self.start_trailing(
-                    &protection.symbol,
-                    Protection {
-                        kind: kind.clone(),
-                        value: leg.value.clone(),
-                        size: Some(target_size.to_string()),
-                    },
-                )
-                .await?
             } else {
                 let (plan, cloid) = self
                     .plan_direct_protection(
@@ -861,27 +852,104 @@ impl ManagedExecutor {
                 }
                 return Ok(Some(self.aggregate_protection_receipt(&receipt, statuses)));
             }
-            if kind == ProtectionKind::TrailingStop && leg.cloid.is_none() {
-                let cloid = self
-                    .trailings
-                    .lock()
-                    .await
-                    .iter()
-                    .find(|trailing| trailing.symbol == protection.symbol)
-                    .map(|trailing| trailing.cloid)
-                    .ok_or_else(|| {
-                        "managed trailing was accepted without active state".to_string()
-                    })?;
-                protection.leg_mut(&kind).expect("leg exists").cloid = Some(cloid);
-            }
             protection.leg_mut(&kind).expect("leg exists").size = target_size;
             self.sync_pending_protection(protection).await?;
         }
-        if entry_complete {
+        if entry_complete
+            && protection
+                .trailing
+                .as_ref()
+                .is_none_or(|leg| leg.size >= target_size)
+        {
             self.remove_pending_protection(protection.id).await?;
         }
         Ok((!statuses.is_empty())
             .then(|| self.aggregate_receipt(ExecutionStatus::Accepted, statuses)))
+    }
+
+    async fn place_trailing_increment(
+        &self,
+        protection: &mut EntryProtection,
+        target: Decimal,
+    ) -> Result<SubmitReceipt, String> {
+        let leg = protection.trailing.as_ref().expect("trailing leg");
+        let pending = leg
+            .tranches
+            .iter()
+            .find(|tranche| tranche.oid.is_none())
+            .cloned();
+        let (operation, size) = if let Some(tranche) = pending {
+            if self
+                .state
+                .read()
+                .await
+                .recovered_trailing_placements
+                .get(&tranche.operation)
+                == Some(&None)
+            {
+                return Err("previous native trailing submission was rejected".into());
+            }
+            (tranche.operation, tranche.size)
+        } else {
+            (
+                format!("attached_trail:{}:{}", protection.id, leg.tranches.len()),
+                target - leg.size,
+            )
+        };
+        let mut plan = {
+            let state = self.state.read().await;
+            Planner::default().plan_for(
+                &state,
+                &protection.symbol,
+                Command::ProtectionSet(Protection {
+                    kind: ProtectionKind::TrailingStop,
+                    value: leg.value.clone(),
+                    size: Some(size.to_string()),
+                    activation: None,
+                }),
+            )?
+        };
+        plan.action_label = operation.clone();
+        if !protection
+            .trailing
+            .as_ref()
+            .expect("leg")
+            .tranches
+            .iter()
+            .any(|tranche| tranche.operation == operation)
+        {
+            protection
+                .trailing
+                .as_mut()
+                .expect("leg")
+                .tranches
+                .push(TrailingTranche {
+                    operation: operation.clone(),
+                    size,
+                    oid: None,
+                });
+            self.sync_pending_protection(protection).await?;
+        }
+        let receipt = self.inner.execute_plan(plan).await?;
+        if accepted(&receipt) {
+            let oid = receipt
+                .statuses
+                .iter()
+                .find_map(|status| match status {
+                    OrderStatus::Resting { oid, .. } => Some(*oid),
+                    _ => None,
+                })
+                .ok_or_else(|| "native trailing acknowledgement missing oid".to_string())?;
+            let leg = protection.trailing.as_mut().expect("leg");
+            leg.tranches
+                .iter_mut()
+                .find(|tranche| tranche.operation == operation)
+                .expect("persisted tranche")
+                .oid = Some(oid);
+            leg.size += size;
+            self.sync_pending_protection(protection).await?;
+        }
+        Ok(receipt)
     }
 
     async fn cancel_remaining_entry_orders(
@@ -940,25 +1008,24 @@ impl ManagedExecutor {
             .collect::<Vec<_>>();
         ids.sort_unstable();
         ids.dedup();
-        let receipt = if ids.is_empty() {
+        let oids = protection
+            .trailing
+            .as_ref()
+            .into_iter()
+            .flat_map(|leg| &leg.tranches)
+            .filter_map(|tranche| tranche.oid)
+            .collect::<Vec<_>>();
+        let receipt = if ids.is_empty() && oids.is_empty() {
             None
         } else {
             let receipt = self
-                .inner
-                .execute_command_for(
-                    &protection.symbol,
-                    Command::CancelCloid { ids: ids.clone() },
-                )
+                .cancel_targets(&protection.symbol, ids.clone(), oids)
                 .await?;
             if !accepted(&receipt) {
                 return Ok(Some(receipt));
             }
             Some(receipt)
         };
-        self.trailings
-            .lock()
-            .await
-            .retain(|trailing| !ids.contains(&trailing.cloid.to_string()));
         self.remove_pending_protection(protection.id).await?;
         Ok(receipt)
     }
@@ -966,15 +1033,18 @@ impl ManagedExecutor {
     async fn refresh_entry_tracking(
         &self,
         protection: &mut EntryProtection,
-    ) -> Result<(Decimal, bool, bool), String> {
+    ) -> Result<(Decimal, bool, bool, bool), String> {
         let state = self.state.read().await;
         protection.recover_entry_outcomes(&state);
+        protection.recover_trailing_outcomes(&state);
         protection.observe_fills(&state.recent_fills);
         let orders_ready = state.orders_ready(
             &protection.symbol,
             now_ms(),
             FreshnessLimits::default().orders_ms,
         );
+        let missing_unfilled_trailing_entry =
+            protection.trailing.is_some() && protection.filled_size() == Decimal::ZERO;
         for entry in &mut protection.entry_orders {
             if entry.terminal {
                 continue;
@@ -985,13 +1055,31 @@ impl ManagedExecutor {
                     || order.value.cloid.as_deref() == Some(cloid.as_str())
             });
             if !live && orders_ready && entry.oid.is_some() {
+                if missing_unfilled_trailing_entry {
+                    return Err(
+                        "owned entry disappeared without an attributable fill; cancellation and operator review required"
+                            .to_string(),
+                    );
+                }
                 entry.terminal = true;
             }
         }
         let filled = protection.filled_size();
         let entry_complete = protection.entry_orders.iter().all(|entry| entry.terminal);
         let mut protection_gone = false;
+        let mut trailing_gone = false;
         if orders_ready {
+            if let Some(leg) = &protection.trailing {
+                trailing_gone = leg
+                    .tranches
+                    .iter()
+                    .filter_map(|tranche| tranche.oid)
+                    .any(|oid| {
+                        !state
+                            .orders_for(&protection.symbol)
+                            .any(|order| order.value.oid == oid)
+                    });
+            }
             for leg in [
                 protection.stop_loss.as_mut(),
                 protection.take_profit.as_mut(),
@@ -1012,11 +1100,22 @@ impl ManagedExecutor {
                 }
             }
         }
-        let Some(position) = state.position(&protection.symbol) else {
-            return Ok((Decimal::ZERO, entry_complete, protection_gone));
-        };
+        let position = state
+            .position(&protection.symbol)
+            .filter(|position| position.age_ms(now_ms()) <= FreshnessLimits::default().position_ms)
+            .ok_or_else(|| {
+                format!(
+                    "fresh position required to reconcile attached protection for {}",
+                    protection.symbol
+                )
+            })?;
         if position.value.flat() {
-            return Ok((Decimal::ZERO, entry_complete, protection_gone));
+            return Ok((
+                Decimal::ZERO,
+                entry_complete,
+                protection_gone,
+                trailing_gone,
+            ));
         }
         if (position.value.size > Decimal::ZERO) != protection.intended_is_buy {
             return Err(format!(
@@ -1028,6 +1127,7 @@ impl ManagedExecutor {
             filled.min(position.value.size.abs()),
             entry_complete,
             protection_gone,
+            trailing_gone,
         ))
     }
 
@@ -1043,6 +1143,7 @@ impl ManagedExecutor {
             &state,
             symbol,
             Command::ProtectionSet(Protection {
+                activation: None,
                 kind,
                 value,
                 size: Some(size.to_string()),
@@ -1088,6 +1189,9 @@ impl ManagedExecutor {
                 .execute_command_for(symbol, Command::TwapCancel { id: Some(id) })
                 .await?;
             statuses.extend(receipt.statuses.clone());
+            if receipt.status == ExecutionStatus::Ambiguous {
+                return Ok(self.aggregate_protection_receipt(&receipt, statuses));
+            }
             if !accepted(&receipt) {
                 errors.push(format!("id {id}: {}", receipt_error(&receipt)));
             }
@@ -1148,46 +1252,6 @@ impl ManagedExecutor {
         }
     }
 
-    async fn poll_trailings(&self) {
-        let _transition = self.transition_lock.lock().await;
-        let trailings = self.trailings.lock().await.clone();
-        for trailing in trailings {
-            let result = self.poll_trailing(trailing.clone()).await;
-            let mut active = self.trailings.lock().await;
-            let changed = match result {
-                TrailPollResult::Keep => false,
-                TrailPollResult::Disarm => {
-                    active.retain(|item| item.cloid != trailing.cloid);
-                    true
-                }
-                TrailPollResult::Throttle {
-                    cloid,
-                    next_move_ms,
-                } => {
-                    if let Some(item) = active.iter_mut().find(|item| item.cloid == cloid) {
-                        item.next_move_ms = next_move_ms;
-                    }
-                    true
-                }
-                TrailPollResult::Moved {
-                    cloid,
-                    trigger,
-                    next_move_ms,
-                } => {
-                    if let Some(item) = active.iter_mut().find(|item| item.cloid == cloid) {
-                        item.trigger = trigger;
-                        item.next_move_ms = next_move_ms;
-                    }
-                    true
-                }
-            };
-            drop(active);
-            if changed && let Err(err) = self.persist().await {
-                eprintln!("{err}");
-            }
-        }
-    }
-
     async fn poll_entry_protections(&self) {
         let _transition = self.transition_lock.lock().await;
         let now = now_ms();
@@ -1229,7 +1293,13 @@ impl ManagedExecutor {
                         .iter_mut()
                         .find(|item| item.id == protection.id)
                     {
-                        item.next_attempt_ms = now.saturating_add(5_000);
+                        item.next_attempt_ms = if protection.entry_cancel_pending {
+                            next_entry_cancel_ms(self.interval)
+                        } else if protection.next_attempt_ms == u64::MAX {
+                            u64::MAX
+                        } else {
+                            now.saturating_add(5_000)
+                        };
                     }
                     if let Err(err) = self.persist().await {
                         eprintln!("{err}");
@@ -1240,51 +1310,6 @@ impl ManagedExecutor {
                     );
                 }
             }
-        }
-    }
-
-    async fn poll_trailing(&self, trailing: ActiveTrailing) -> TrailPollResult {
-        let now = now_ms();
-        if now < trailing.next_move_ms {
-            return TrailPollResult::Keep;
-        }
-        let planned = {
-            let state = self.state.read().await;
-            let cloid = trailing.cloid.to_string();
-            let Some(order) = state
-                .orders_for(&trailing.symbol)
-                .find(|order| order.value.cloid.as_deref() == Some(cloid.as_str()))
-            else {
-                return TrailPollResult::Disarm;
-            };
-            if order.value.kind != OrderKind::StopLoss {
-                return TrailPollResult::Disarm;
-            }
-            let Some(market) = state.markets.get(&trailing.symbol) else {
-                return TrailPollResult::Disarm;
-            };
-            let target = match trailing_target(&state, &trailing) {
-                Ok(target) => target,
-                Err(_) => return TrailPollResult::Keep,
-            };
-            if !trail_should_move(&trailing, target) {
-                return TrailPollResult::Keep;
-            }
-            match trailing_modify_plan(&trailing, market, &order.value, target) {
-                Ok(plan) => (plan, target),
-                Err(_) => return TrailPollResult::Keep,
-            }
-        };
-        match self.inner.execute_plan(planned.0).await {
-            Ok(receipt) if accepted(&receipt) => TrailPollResult::Moved {
-                cloid: trailing.cloid,
-                trigger: planned.1,
-                next_move_ms: next_trailing_move_ms(self.interval),
-            },
-            _ => TrailPollResult::Throttle {
-                cloid: trailing.cloid,
-                next_move_ms: next_trailing_move_ms(self.interval),
-            },
         }
     }
 
@@ -1421,15 +1446,6 @@ impl CommandExecutor for ManagedExecutor {
                 return Some("managed chase active".to_string());
             }
             if self
-                .trailings
-                .lock()
-                .await
-                .iter()
-                .any(|active| active.symbol == symbol)
-            {
-                return Some("managed trailing stop active".to_string());
-            }
-            if self
                 .entry_protections
                 .lock()
                 .await
@@ -1483,6 +1499,24 @@ fn receipt_error(receipt: &SubmitReceipt) -> String {
 }
 
 impl EntryProtection {
+    fn recover_trailing_outcomes(&mut self, state: &TradingState) {
+        if let Some(leg) = self.trailing.as_mut() {
+            for tranche in &mut leg.tranches {
+                if tranche.oid.is_none()
+                    && let Some(oid) = state.recovered_trailing_placements.get(&tranche.operation)
+                {
+                    tranche.oid = *oid;
+                }
+            }
+            leg.size = leg
+                .tranches
+                .iter()
+                .filter(|tranche| tranche.oid.is_some())
+                .map(|tranche| tranche.size)
+                .sum();
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.stop_loss.is_none() && self.take_profit.is_none() && self.trailing.is_none()
     }
@@ -1590,9 +1624,8 @@ impl EntryProtection {
 impl ManagedSnapshot {
     fn empty() -> Self {
         Self {
-            version: 2,
+            version: 3,
             chases: Vec::new(),
-            trailings: Vec::new(),
             entry_protections: Vec::new(),
         }
     }
@@ -1614,8 +1647,28 @@ impl ManagedSnapshot {
             );
             value["version"] = serde_json::Value::from(2);
         }
+        if value.get("version").and_then(serde_json::Value::as_u64) == Some(2) {
+            anyhow::ensure!(
+                value
+                    .get("trailings")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                    && value
+                        .get("entryProtections")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|entries| entries.iter().all(|entry| entry
+                            .get("trailing")
+                            .is_none_or(serde_json::Value::is_null))),
+                "legacy local trailing state is active; drain/cancel trailing and protected entry orders using the previous binary before upgrading (no automatic watermark migration)"
+            );
+            value
+                .as_object_mut()
+                .expect("versioned object")
+                .remove("trailings");
+            value["version"] = serde_json::Value::from(3);
+        }
         let snapshot: Self = serde_json::from_value(value)?;
-        anyhow::ensure!(snapshot.version == 2, "unsupported managed-state version");
+        anyhow::ensure!(snapshot.version == 3, "unsupported managed-state version");
         let mut chase_keys = std::collections::BTreeSet::new();
         for chase in &snapshot.chases {
             anyhow::ensure!(
@@ -1628,21 +1681,41 @@ impl ManagedSnapshot {
                 chase.symbol
             );
         }
-        let mut trailing_symbols = std::collections::BTreeSet::new();
-        for trailing in &snapshot.trailings {
-            anyhow::ensure!(
-                !trailing.symbol.trim().is_empty(),
-                "managed trailing symbol is empty"
-            );
-            anyhow::ensure!(
-                trailing_symbols.insert(trailing.symbol.clone()),
-                "duplicate managed trailing for {}",
-                trailing.symbol
-            );
-        }
         let mut protection_symbols = std::collections::BTreeSet::new();
         let mut protection_ids = std::collections::BTreeSet::new();
         for protection in &snapshot.entry_protections {
+            if let Some(leg) = &protection.trailing {
+                crate::planner::parse_retracement(&leg.value).map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(
+                    leg.cloid.is_none(),
+                    "native trailing attachment must use acknowledged OIDs, never a cloid"
+                );
+                let mut oids = std::collections::BTreeSet::new();
+                for (index, tranche) in leg.tranches.iter().enumerate() {
+                    anyhow::ensure!(
+                        tranche.operation == format!("attached_trail:{}:{index}", protection.id)
+                            && tranche.size > Decimal::ZERO,
+                        "invalid native trailing tranche operation or size"
+                    );
+                    if let Some(oid) = tranche.oid {
+                        anyhow::ensure!(
+                            oid > 0 && oids.insert(oid),
+                            "invalid or duplicate native trailing tranche oid"
+                        );
+                    }
+                }
+                let acknowledged_size = leg
+                    .tranches
+                    .iter()
+                    .filter(|tranche| tranche.oid.is_some())
+                    .map(|tranche| tranche.size)
+                    .sum::<Decimal>();
+                anyhow::ensure!(
+                    leg.size == acknowledged_size,
+                    "native trailing protected size disagrees with acknowledged tranches"
+                );
+            }
+
             anyhow::ensure!(
                 !protection.symbol.trim().is_empty()
                     && !protection.is_empty()
@@ -1667,7 +1740,6 @@ impl ManagedSnapshot {
         self.chases
             .iter()
             .map(|item| item.symbol.clone())
-            .chain(self.trailings.iter().map(|item| item.symbol.clone()))
             .chain(
                 self.entry_protections
                     .iter()
@@ -1729,6 +1801,9 @@ fn trade_entry_protection(
     }
     if trade.trailing.is_some() && trade.stop_loss.is_some() {
         return Err("Specify only one stop type: sl/stop or trailing/tsl".to_string());
+    }
+    if let Some(trailing) = &trade.trailing {
+        crate::planner::parse_retracement(trailing)?;
     }
     let Action::Order(batch) = &plan.action else {
         return Err("protected entry did not produce an order batch".to_string());
@@ -1851,6 +1926,7 @@ fn managed_leg(value: String) -> ManagedProtectionLeg {
         value,
         cloid: None,
         size: Decimal::ZERO,
+        tranches: Vec::new(),
     }
 }
 
@@ -1876,6 +1952,9 @@ fn entry_orders(plan: &ActionPlan) -> Result<Vec<EntryOrder>, String> {
 }
 
 fn validate_scale_prices(scale: &Scale) -> Result<(), String> {
+    if let Some(trailing) = &scale.trailing {
+        crate::planner::parse_retracement(trailing)?;
+    }
     let start = decimal("start price", &scale.start_price)?;
     let end = decimal("end price", &scale.end_price)?;
     let low = start.min(end);
@@ -2029,135 +2108,10 @@ fn chase_modify_plan(
     })
 }
 
-fn active_trailing_from_plan(
-    symbol: &str,
-    plan: &ActionPlan,
-    distance: TrailDistance,
-    interval: Duration,
-) -> Result<ActiveTrailing, String> {
-    let Action::Order(batch) = &plan.action else {
-        return Err("trailing plan did not produce an order".to_string());
-    };
-    let order = batch
-        .orders
-        .first()
-        .ok_or_else(|| "trailing plan missing order".to_string())?;
-    let trigger = match &order.order_type {
-        OrderType::Trigger { trigger_px, .. } => *trigger_px,
-        OrderType::Limit { .. } => {
-            return Err("trailing plan did not produce a trigger".to_string());
-        }
-    };
-    Ok(ActiveTrailing {
-        symbol: symbol.to_string(),
-        cloid: order.cloid,
-        side: if order.is_buy { Side::Bid } else { Side::Ask },
-        distance,
-        trigger,
-        next_move_ms: next_trailing_move_ms(interval),
-    })
-}
-
-fn parse_trail_distance(raw: &str) -> Result<TrailDistance, String> {
-    if let Some(pct) = raw.strip_suffix('%') {
-        let pct = decimal("trailing percent", pct.trim())?;
-        if pct <= Decimal::ZERO {
-            return Err("trailing percent must be positive".to_string());
-        }
-        Ok(TrailDistance::Percent(pct))
-    } else {
-        let value = decimal("trailing distance", raw.trim_end_matches('$').trim())?;
-        if value <= Decimal::ZERO {
-            return Err("trailing distance must be positive".to_string());
-        }
-        Ok(TrailDistance::Absolute(value))
-    }
-}
-
-fn trailing_target(state: &TradingState, trailing: &ActiveTrailing) -> Result<Decimal, String> {
-    let book = state
-        .book
-        .get(&trailing.symbol)
-        .ok_or_else(|| "book unavailable for trailing".to_string())?;
-    if book.age_ms(now_ms()) > FreshnessLimits::default().book_ms {
-        return Err("fresh book required for trailing".to_string());
-    }
-    let book = book.value;
-    let mid = ((book.bid + book.ask) / Decimal::TWO).normalize();
-    let distance = match trailing.distance {
-        TrailDistance::Absolute(distance) => distance,
-        TrailDistance::Percent(percent) => (mid * percent / Decimal::from(100)).normalize(),
-    };
-    let raw = match trailing.side {
-        Side::Ask => mid - distance,
-        Side::Bid => mid + distance,
-    }
-    .normalize();
-    if raw <= Decimal::ZERO {
-        return Err("trailing trigger must be positive".to_string());
-    }
-    let market = state
-        .markets
-        .get(&trailing.symbol)
-        .ok_or_else(|| format!("unknown market {}", trailing.symbol))?;
-    market
-        .tick()
-        .round_for_side(trailing.side, raw, true)
-        .map(|price| price.normalize())
-        .ok_or_else(|| format!("invalid trigger for {}", trailing.symbol))
-}
-
-fn trail_should_move(trailing: &ActiveTrailing, target: Decimal) -> bool {
-    match trailing.side {
-        Side::Ask => target > trailing.trigger,
-        Side::Bid => target < trailing.trigger,
-    }
-}
-
-fn trailing_modify_plan(
-    trailing: &ActiveTrailing,
-    market: &Market,
-    order: &Order,
-    trigger_px: Decimal,
-) -> Result<ActionPlan, String> {
-    Ok(ActionPlan {
-        kind: "trailing_move",
-        market: trailing.symbol.clone(),
-        action_label: "trailing_move".to_string(),
-        requires_book: true,
-        action: Action::BatchModify(BatchModify {
-            modifies: vec![Modify {
-                oid: OrderTarget::Cloid(trailing.cloid),
-                order: OrderRequest {
-                    asset: market.asset.0,
-                    is_buy: trailing.side == Side::Bid,
-                    price: trigger_px,
-                    size: order.size,
-                    reduce_only: true,
-                    order_type: OrderType::Trigger {
-                        is_market: true,
-                        trigger_px,
-                        tpsl: TpSl::Sl,
-                    },
-                    cloid: trailing.cloid,
-                },
-            }],
-        }),
-    })
-}
-
 fn next_chase_move_ms(interval: Duration) -> u64 {
     let delay = interval
         .as_millis()
         .saturating_mul(120)
-        .min(u128::from(u64::MAX)) as u64;
-    now_ms().saturating_add(delay)
-}
-
-fn next_trailing_move_ms(interval: Duration) -> u64 {
-    let delay = interval
-        .as_millis()
-        .saturating_mul(20)
         .min(u128::from(u64::MAX)) as u64;
     now_ms().saturating_add(delay)
 }
@@ -2188,6 +2142,137 @@ fn decimal(name: &str, raw: &str) -> Result<Decimal, String> {
 mod contract_tests {
     use super::*;
     use crate::state::{Fill, RecoveredOrderOutcome};
+
+    #[test]
+    fn upgrade_drains_legacy_trails_and_preserves_safe_nontrailing_work() {
+        let path = std::env::temp_dir().join(format!(
+            "hlcli-upgrade-{}-{}.json",
+            std::process::id(),
+            now_ms()
+        ));
+        let id = Cloid::from_u128(1).unwrap();
+        let fixed = EntryProtection {
+            id,
+            symbol: "BTC".into(),
+            intended_is_buy: true,
+            entry_orders: vec![EntryOrder {
+                cloid: id,
+                oid: Some(42),
+                receipt_filled: Decimal::ZERO,
+                feed_filled: "0.005".parse().unwrap(),
+                seen_fill_tids: std::collections::BTreeSet::from([7]),
+                terminal: false,
+            }],
+            stop_loss: Some(ManagedProtectionLeg {
+                value: "48000".into(),
+                cloid: Some(Cloid::from_u128(2).unwrap()),
+                size: "0.005".parse().unwrap(),
+                tranches: vec![],
+            }),
+            take_profit: None,
+            trailing: None,
+            entry_cancel_pending: false,
+            next_attempt_ms: 0,
+        };
+        let chase = ActiveChase {
+            symbol: "ETH".into(),
+            is_buy: true,
+            cloid: Cloid::from_u128(3).unwrap(),
+            distance: ChaseDistance::Quote,
+            tif: TimeInForce::Alo,
+            next_move_ms: 0,
+        };
+        let mut fixed_json = serde_json::to_value(&fixed).unwrap();
+        fixed_json["stopLoss"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tranches");
+        let legacy = serde_json::json!({"version":2,"chases":[chase],"trailings":[],"entryProtections":[fixed_json]});
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let migrated = ManagedSnapshot::load(&path).unwrap();
+        assert_eq!(migrated.version, 3);
+        assert_eq!(migrated.chases[0].cloid, chase.cloid);
+        assert_eq!(migrated.entry_protections[0].entry_orders[0].oid, Some(42));
+        assert_eq!(
+            migrated.entry_protections[0].entry_orders[0].seen_fill_tids,
+            std::collections::BTreeSet::from([7])
+        );
+        assert_eq!(
+            migrated.entry_protections[0]
+                .stop_loss
+                .as_ref()
+                .unwrap()
+                .cloid,
+            fixed.stop_loss.as_ref().unwrap().cloid
+        );
+        assert!(
+            serde_json::to_value(&migrated)
+                .unwrap()
+                .get("trailings")
+                .is_none()
+        );
+        for field in ["trailings", "entryProtections"] {
+            let mut unsafe_state = legacy.clone();
+            unsafe_state[field] = if field == "trailings" {
+                serde_json::json!([{"symbol":"BTC"}])
+            } else {
+                serde_json::json!([{"trailing":{"value":"1%"}}])
+            };
+            fs::write(&path, serde_json::to_vec(&unsafe_state).unwrap()).unwrap();
+            assert!(
+                ManagedSnapshot::load(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("previous binary")
+            );
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recovered_tranche_relinks_exact_ack_identity_without_changing_watermark() {
+        let id = Cloid::from_u128(3).unwrap();
+        let operation = format!("attached_trail:{id}:0");
+        let mut leg = managed_leg("1%".into());
+        leg.tranches.push(TrailingTranche {
+            operation: operation.clone(),
+            size: "0.005".parse().unwrap(),
+            oid: None,
+        });
+        let mut protection = EntryProtection {
+            id,
+            symbol: "BTC".into(),
+            intended_is_buy: true,
+            entry_orders: vec![],
+            stop_loss: None,
+            take_profit: None,
+            trailing: Some(leg),
+            entry_cancel_pending: false,
+            next_attempt_ms: 0,
+        };
+        let mut state = TradingState::new("BTC");
+        state
+            .recovered_trailing_placements
+            .insert(operation, Some(42));
+        state
+            .recovered_trailing_placements
+            .insert("attached_trail:unrelated:0".into(), Some(99));
+        protection.recover_trailing_outcomes(&state);
+        assert_eq!(
+            protection.trailing.as_ref().unwrap().tranches[0].oid,
+            Some(42)
+        );
+        assert_eq!(
+            protection.trailing.as_ref().unwrap().size,
+            "0.005".parse().unwrap()
+        );
+        protection.recover_trailing_outcomes(&state);
+        assert_eq!(
+            protection.trailing.as_ref().unwrap().size,
+            "0.005".parse().unwrap(),
+            "replay must not double-protect the fill"
+        );
+    }
 
     #[test]
     fn persisted_trade_ids_make_fill_replay_idempotent_across_restart() {
@@ -2260,7 +2345,6 @@ mod contract_tests {
         );
 
         protection.recover_entry_outcomes(&state);
-
         assert_eq!(protection.entry_orders[0].oid, Some(42));
         assert_eq!(protection.filled_size(), "0.01".parse().unwrap());
         assert!(protection.entry_orders[0].terminal);

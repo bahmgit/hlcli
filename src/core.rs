@@ -357,6 +357,20 @@ where
                 .await;
         }
         self.apply_receipt(&plan.market, &action, &receipt).await;
+        if plan.action_label.starts_with("attached_trail:")
+            && receipt.error.is_none()
+            && receipt.status != ExecutionStatus::Ambiguous
+        {
+            let oid = receipt.statuses.iter().find_map(|status| match status {
+                OrderStatus::Resting { oid, .. } => Some(*oid),
+                _ => None,
+            });
+            self.state
+                .write()
+                .await
+                .recovered_trailing_placements
+                .insert(plan.action_label.clone(), oid);
+        }
         let delta = self.metrics.snapshot().delta(before);
         debug_assert!(delta.forbidden_submit_path_activity().is_empty());
         Ok(receipt)
@@ -365,6 +379,54 @@ where
     async fn recover_unresolved(&self) -> Result<(), String> {
         if self.recovery_complete.load(Ordering::Acquire) {
             return Ok(());
+        }
+        let records = self
+            .kernel
+            .journal()
+            .read_all()
+            .map_err(|err| format!("read execution journal: {err}"))?;
+        for record in records
+            .iter()
+            .filter(|record| record.action.starts_with("attached_trail:"))
+        {
+            if matches!(
+                record.phase,
+                crate::execution::JournalPhase::Accepted
+                    | crate::execution::JournalPhase::Rejected
+                    | crate::execution::JournalPhase::ReconciledAccepted
+                    | crate::execution::JournalPhase::ReconciledRejected
+            ) {
+                let action: Action = serde_json::from_str(
+                    record
+                        .context
+                        .as_ref()
+                        .and_then(|context| context.action_json.as_deref())
+                        .ok_or_else(|| {
+                            "native trailing journal outcome missing action context".to_string()
+                        })?,
+                )
+                .map_err(|err| format!("decode native trailing journal outcome: {err}"))?;
+                if !matches!(action, Action::TrailingStop(_)) {
+                    return Err("native trailing correlation refers to another action type".into());
+                }
+                if matches!(
+                    record.phase,
+                    crate::execution::JournalPhase::Accepted
+                        | crate::execution::JournalPhase::ReconciledAccepted
+                ) && !matches!(record.statuses.as_slice(), [OrderStatus::Resting { oid, cloid: None }] if *oid > 0)
+                {
+                    return Err("accepted native trailing journal outcome missing exact oid".into());
+                }
+                let oid = record.statuses.iter().find_map(|status| match status {
+                    OrderStatus::Resting { oid, .. } => Some(*oid),
+                    _ => None,
+                });
+                self.state
+                    .write()
+                    .await
+                    .recovered_trailing_placements
+                    .insert(record.action.clone(), oid);
+            }
         }
         let unresolved = self
             .kernel
@@ -464,6 +526,34 @@ where
         let now = now_ms();
         let mut state = self.state.write().await;
         match action {
+            Action::TrailingStop(action) if accepted(receipt) => {
+                if let Some(OrderStatus::Resting { oid, .. }) = receipt.statuses.first() {
+                    state.apply_resting_receipt(
+                        crate::state::Order {
+                            symbol: market.into(),
+                            oid: *oid,
+                            cloid: None,
+                            is_buy: action.is_buy,
+                            price: Decimal::ZERO,
+                            size: action.size,
+                            reduce_only: true,
+                            kind: crate::state::OrderKind::TrailingStop,
+                            tif: None,
+                            fast_cancel_eligible: false,
+                            trailing: Some(crate::state::NativeTrailing {
+                                retracement: action.retracement.clone(),
+                                activation: action
+                                    .activation_px
+                                    .as_ref()
+                                    .and_then(|px| px.parse().ok()),
+                                best: None,
+                            }),
+                        },
+                        now,
+                        now,
+                    );
+                }
+            }
             Action::Order(batch) => {
                 for (request, status) in batch.orders.iter().zip(&receipt.statuses) {
                     apply_order_status(&mut state, market, request, status, now);
@@ -532,13 +622,19 @@ where
                 }
             }
             Action::TwapOrder(action) if accepted(receipt) => {
+                let dex = state
+                    .markets
+                    .get(market)
+                    .and_then(|market| market.dex.clone())
+                    .unwrap_or_default();
                 for status in &receipt.statuses {
                     if let OrderStatus::TwapRunning { twap_id } = status {
                         state.apply_twap(
                             *twap_id,
                             Twap {
+                                details: action.details.as_deref().cloned(),
                                 symbol: market.to_string(),
-                                dex: String::new(),
+                                dex: dex.clone(),
                                 is_buy: action.twap.is_buy,
                                 size: action.twap.size,
                                 executed_size: Decimal::ZERO,
@@ -848,6 +944,8 @@ fn order_from_request(
         OrderType::Trigger { .. } => None,
     };
     Order {
+        fast_cancel_eligible: false,
+        trailing: None,
         symbol: market.to_string(),
         oid,
         cloid,
@@ -946,18 +1044,67 @@ fn validate_perp_capacity(state: &TradingState, plan: &ActionPlan) -> Result<(),
 }
 
 fn validate_plan(state: &TradingState, plan: &ActionPlan) -> Result<(), String> {
-    plan.validate(
-        state
-            .markets
-            .get(&plan.market)
-            .ok_or_else(|| format!("unknown planned market {}", plan.market))?,
-    )
+    let market = state
+        .markets
+        .get(&plan.market)
+        .ok_or_else(|| format!("unknown planned market {}", plan.market))?;
+    plan.validate(market)?;
+    if matches!(plan.action, Action::TrailingStop(_) | Action::TwapOrder(_)) {
+        crate::planner::validate_reduce_only_plan(state, plan)?;
+    }
+    match &plan.action {
+        Action::Cancel(batch) if batch.fast => {
+            if batch.cancels.is_empty()
+                || !state.orders_ready(&plan.market, now_ms(), FreshnessLimits::default().orders_ms)
+                || !batch.cancels.iter().all(|cancel| {
+                    cancel.asset == market.asset.0
+                        && state.orders_for(&plan.market).any(|order| {
+                            order.value.oid == cancel.oid && order.value.fast_cancel_eligible
+                        })
+                })
+            {
+                return Err("fast cancel requires every target to be a fresh known non-trigger order without children".into());
+            }
+        }
+        Action::CancelByCloid(batch) if batch.fast => {
+            if batch.cancels.is_empty()
+                || !state.orders_ready(&plan.market, now_ms(), FreshnessLimits::default().orders_ms)
+                || !batch.cancels.iter().all(|cancel| {
+                    cancel.asset == market.asset.0
+                        && state.orders_for(&plan.market).any(|order| {
+                            order.value.cloid.as_deref() == Some(cancel.cloid.to_string().as_str())
+                                && order.value.fast_cancel_eligible
+                        })
+                })
+            {
+                return Err("fast cancel requires every target to be a fresh known non-trigger order without children".into());
+            }
+        }
+        Action::TwapOrder(action) => {
+            if let Some(details) = &action.details
+                && let Some(raw) = &details.s
+            {
+                let stop: Decimal = raw.parse().map_err(|_| "invalid TWAP stop".to_string())?;
+                let reference = match &details.t {
+                    Some(trigger) => trigger.p,
+                    None => crate::planner::fresh_mark(state, &plan.market)?,
+                };
+                if (action.twap.is_buy && stop <= reference)
+                    || (!action.twap.is_buy && stop >= reference)
+                {
+                    return Err("TWAP stop is on the wrong side of trigger/current mark".into());
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn needs_orders(plan: &ActionPlan) -> bool {
     matches!(
         plan.action,
-        Action::Order(_) | Action::BatchModify(_) | Action::TwapOrder(_)
+        Action::Order(_) | Action::TrailingStop(_) | Action::BatchModify(_) | Action::TwapOrder(_)
     )
 }
 
@@ -1074,6 +1221,7 @@ fn applies_account_mode_guard(plan: &ActionPlan) -> bool {
     matches!(
         plan.action,
         Action::Order(_)
+            | Action::TrailingStop(_)
             | Action::TwapOrder(_)
             | Action::UpdateLeverage(_)
             | Action::UpdateIsolatedMargin(_)
@@ -1085,11 +1233,14 @@ fn needs_book(plan: &ActionPlan) -> bool {
 }
 
 fn needs_position(plan: &ActionPlan) -> bool {
-    matches!(plan.action, Action::Order(_))
+    matches!(plan.action, Action::Order(_) | Action::TrailingStop(_))
 }
 
 fn needs_fresh_position(plan: &ActionPlan) -> bool {
-    matches!(plan.action, Action::UpdateIsolatedMargin(_))
+    matches!(
+        plan.action,
+        Action::UpdateIsolatedMargin(_) | Action::TrailingStop(_)
+    )
 }
 
 fn orders_fresh(state: &TradingState, symbol: &str, now_ms: u64, max_age_ms: u64) -> bool {

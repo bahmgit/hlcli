@@ -514,7 +514,10 @@ impl InfoClient {
             allowed_symbols,
             None,
         )?;
-        for dex in parse_perp_dexs(&self.post(json!({ "type": "perpDexs" })).await?)? {
+        for dex in parse_perp_dexs(
+            &self.post(json!({ "type": "perpDexs" })).await?,
+            allowed_symbols,
+        )? {
             let value = self
                 .post(json!({ "type": "metaAndAssetCtxs", "dex": dex.name.as_str() }))
                 .await?;
@@ -607,6 +610,30 @@ impl InfoClient {
             market.dex.as_deref(),
             &dex_symbol_refs,
         )?;
+        let dexes = state
+            .markets
+            .values()
+            .map(|market| market.dex.clone())
+            .collect::<BTreeSet<_>>();
+        for dex in dexes {
+            if dex == market.dex {
+                continue;
+            }
+            let request_ms = now_ms();
+            let orders = self
+                .post(user_scoped("frontendOpenOrders", user, dex.as_deref()))
+                .await?;
+            let symbols = symbols_in_dex(state, dex.as_deref());
+            let refs = symbols.iter().map(String::as_str).collect::<Vec<_>>();
+            apply_open_orders_for_symbols(
+                state,
+                &orders,
+                now_ms(),
+                request_ms,
+                dex.as_deref(),
+                &refs,
+            )?;
+        }
         if let Some(active_asset) = active_asset {
             state.apply_active_asset(
                 active,
@@ -829,8 +856,11 @@ struct SpotMarket {
     quote: String,
 }
 
-fn parse_perp_dexs(value: &Value) -> anyhow::Result<Vec<PerpDex>> {
-    value
+fn parse_perp_dexs(
+    value: &Value,
+    allowed_symbols: &BTreeSet<String>,
+) -> anyhow::Result<Vec<PerpDex>> {
+    let dexes: Vec<PerpDex> = value
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("perpDexs response must be array"))?
         .iter()
@@ -846,7 +876,18 @@ fn parse_perp_dexs(value: &Value) -> anyhow::Result<Vec<PerpDex>> {
                     .to_string(),
             })
         })
-        .collect()
+        .collect::<anyhow::Result<_>>()?;
+    Ok(dexes
+        .into_iter()
+        .filter(|dex| {
+            allowed_symbols.is_empty()
+                || allowed_symbols.iter().any(|symbol| {
+                    symbol
+                        .split_once(':')
+                        .is_some_and(|(prefix, _)| prefix.eq_ignore_ascii_case(&dex.name))
+                })
+        })
+        .collect())
 }
 
 fn parse_spot_markets(value: &Value) -> anyhow::Result<Vec<SpotMarket>> {
@@ -1173,6 +1214,13 @@ pub(crate) fn apply_positions_for_watched(
     dex: Option<&str>,
     watched: &BTreeSet<String>,
 ) -> anyhow::Result<()> {
+    let exchange_ms = match value.get("time") {
+        Some(time) => time
+            .as_u64()
+            .filter(|time| *time > 0)
+            .ok_or_else(|| anyhow::anyhow!("clearinghouseState time must be a positive integer"))?,
+        None => exchange_ms,
+    };
     let representative = watched
         .iter()
         .find(|symbol| {
@@ -1517,7 +1565,9 @@ pub(crate) fn apply_open_orders_for_symbols(
             .map(ToOwned::to_owned);
         let previous = previous_order(state, oid, cloid.as_deref());
         let is_trigger = bool_field(row, &["isTrigger", "is_trigger"]);
-        let kind = if is_trigger {
+        let kind = if row.get("orderType").and_then(Value::as_str) == Some("Trailing Stop Market") {
+            OrderKind::TrailingStop
+        } else if is_trigger {
             order_kind(row)
                 .or_else(|| previous.map(|existing| existing.kind.clone()))
                 .filter(|kind| *kind != OrderKind::Limit)
@@ -1538,12 +1588,30 @@ pub(crate) fn apply_open_orders_for_symbols(
         let reduce_only = optional_bool(row, &["reduceOnly", "reduce_only"])
             .or_else(|| previous.map(|existing| existing.reduce_only))
             .ok_or_else(|| anyhow::anyhow!("open order missing reduceOnly"))?;
+        let trailing = if kind == OrderKind::TrailingStop {
+            Some(parse_native_trailing(row, is_buy)?)
+        } else {
+            None
+        };
+        let price = if let Some(trailing) = &trailing {
+            native_trailing_trigger(trailing, is_buy)?
+        } else {
+            order_price(row, &kind, previous)?
+        };
         let order = Order {
+            fast_cancel_eligible: kind == OrderKind::Limit
+                && !is_trigger
+                && row.get("isTrigger").and_then(Value::as_bool) == Some(false)
+                && row
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty),
+            trailing,
             symbol: symbol.clone(),
             oid,
             cloid,
             is_buy,
-            price: order_price(row, &kind, previous)?,
+            price,
             size: decimal_field(row, &["sz", "origSz", "size"])?,
             reduce_only,
             tif: if kind == OrderKind::Limit {
@@ -1627,7 +1695,9 @@ fn order_kind(row: &Value) -> Option<OrderKind> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if trigger.contains("take")
+    if order_type == "trailing stop market" {
+        Some(OrderKind::TrailingStop)
+    } else if trigger.contains("take")
         || trigger.contains("tp")
         || order_type.contains("take")
         || order_type.contains("tp")
@@ -1786,9 +1856,224 @@ fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+fn parse_native_trailing(
+    row: &Value,
+    is_buy: bool,
+) -> anyhow::Result<crate::state::NativeTrailing> {
+    let condition = row
+        .get("triggerCondition")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("native trailing missing triggerCondition"))?
+        .to_ascii_lowercase();
+    let mut retracement = None;
+    let mut activation = None;
+    let mut activation_seen = false;
+    let mut best = None;
+    let mut best_seen = false;
+    for part in condition.split(',').map(str::trim) {
+        if let Some(raw) = part.strip_prefix("retracement ") {
+            anyhow::ensure!(retracement.is_none(), "duplicate trailing retracement");
+            retracement = Some(crate::planner::parse_retracement(raw).map_err(anyhow::Error::msg)?);
+        } else if let Some(raw) = part.strip_prefix("activation ") {
+            anyhow::ensure!(!activation_seen, "duplicate trailing activation");
+            activation_seen = true;
+            if raw.trim() == "immediate" {
+                continue;
+            }
+            let (direction, raw) = raw
+                .trim()
+                .split_once(' ')
+                .ok_or_else(|| anyhow::anyhow!("invalid trailing activation"))?;
+            anyhow::ensure!(
+                direction == if is_buy { "below" } else { "above" },
+                "trailing activation direction disagrees with order side"
+            );
+            let px = decimal(raw.trim())?;
+            anyhow::ensure!(px > Decimal::ZERO, "trailing activation must be positive");
+            activation = Some(px);
+        } else if let Some(raw) = part.strip_prefix("best ") {
+            anyhow::ensure!(!best_seen, "duplicate trailing watermark");
+            best_seen = true;
+            if raw.trim() != "waiting" {
+                let px = decimal(raw.trim())?;
+                anyhow::ensure!(px > Decimal::ZERO, "trailing watermark must be positive");
+                best = Some(px);
+            }
+        } else {
+            anyhow::bail!("unknown native trailing condition component {part}");
+        }
+    }
+    Ok(crate::state::NativeTrailing {
+        retracement: retracement
+            .ok_or_else(|| anyhow::anyhow!("native trailing missing retracement"))?,
+        activation,
+        best,
+    })
+}
+
+fn native_trailing_trigger(
+    trailing: &crate::state::NativeTrailing,
+    is_buy: bool,
+) -> anyhow::Result<Decimal> {
+    let Some(best) = trailing.best else {
+        return Ok(Decimal::ZERO);
+    };
+    let distance = match &trailing.retracement {
+        crate::protocol::Retracement::Px(px) => *px,
+        crate::protocol::Retracement::Pct(raw) => {
+            let fraction = decimal(raw.trim_end_matches('%'))? / Decimal::from(100);
+            best.checked_mul(fraction)
+                .ok_or_else(|| anyhow::anyhow!("native trailing retracement overflow"))?
+        }
+    };
+    let trigger = if is_buy {
+        best.checked_add(distance)
+    } else {
+        best.checked_sub(distance)
+    }
+    .ok_or_else(|| anyhow::anyhow!("native trailing derived trigger overflow"))?;
+    anyhow::ensure!(
+        trigger > Decimal::ZERO,
+        "native trailing derived trigger is nonpositive"
+    );
+    Ok(trigger.normalize())
+}
+
 #[cfg(test)]
 mod contract_tests {
     use super::*;
+
+    #[test]
+    fn older_clearinghouse_snapshot_cannot_erase_an_acknowledged_fill() {
+        let mut state = TradingState::new("BTC");
+        state.set_market(Market {
+            symbol: "BTC".into(),
+            wire_symbol: "BTC".into(),
+            dex: None,
+            asset: AssetId::native_perp(0),
+            kind: MarketKind::Perp,
+            size_decimals: 5,
+            max_leverage: Some(40),
+            delisted: false,
+            open_interest_cap: false,
+        });
+        state.apply_fill_position(
+            Position {
+                symbol: "BTC".into(),
+                size: "0.02".parse().unwrap(),
+                entry_price: Some("50000".parse().unwrap()),
+                detail: None,
+            },
+            200,
+            200,
+        );
+        apply_positions_for_watched(
+            &mut state,
+            &json!({"assetPositions":[],"time":100}),
+            300,
+            250,
+            None,
+            &BTreeSet::from(["BTC".into()]),
+        )
+        .unwrap();
+        assert_eq!(
+            state.position("BTC").unwrap().value.size,
+            "0.02".parse().unwrap()
+        );
+        apply_positions_for_watched(
+            &mut state,
+            &json!({"assetPositions":[],"time":400}),
+            500,
+            450,
+            None,
+            &BTreeSet::from(["BTC".into()]),
+        )
+        .unwrap();
+        assert!(state.position("BTC").unwrap().value.flat());
+    }
+
+    #[test]
+    fn metadata_discovery_skips_unconfigured_dexes_without_renumbering_assets() {
+        let value = json!([null, {"name":"first"}, {"name":"xyz"}, {"name":"last"}]);
+        let native = BTreeSet::from(["BTC".to_string(), "SPOT:BTC/USDC".to_string()]);
+        assert!(parse_perp_dexs(&value, &native).unwrap().is_empty());
+        let configured = BTreeSet::from(["BTC".to_string(), "XYZ:BTC".to_string()]);
+        let selected = parse_perp_dexs(&value, &configured).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "xyz");
+        assert_eq!(
+            selected[0].index, 2,
+            "exchange DEX indices must survive filtering"
+        );
+        assert_eq!(parse_perp_dexs(&value, &BTreeSet::new()).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn native_trailing_snapshot_adopts_watermark_and_keeps_fixed_stops_distinct() {
+        let mut state = TradingState::new("BTC");
+        state.set_market(Market {
+            symbol: "BTC".into(),
+            wire_symbol: "BTC".into(),
+            dex: None,
+            asset: AssetId(0),
+            kind: MarketKind::Perp,
+            size_decimals: 5,
+            max_leverage: Some(40),
+            delisted: false,
+            open_interest_cap: false,
+        });
+        let native = |oid, side, condition| json!({"coin":"BTC", "oid":oid,"side":side,"sz":"0.01","reduceOnly":true,"isTrigger":true,"orderType":"Trailing Stop Market","triggerCondition":condition,"triggerPx":"0","limitPx":"0","children":[]});
+        let immediate = parse_native_trailing(
+            &native(9, "A", "Activation immediate, retracement 1%, best 53000"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(immediate.activation, None);
+        assert_eq!(immediate.best, Some("53000".parse().unwrap()));
+        let rows = json!([
+            native(1,"A","Retracement 1%, Activation above 52000, Best 53000"),
+            native(2,"B","retracement 150, activation below 48000, best waiting"),
+            {"coin":"BTC","oid":3,"side":"A","sz":"0.01","reduceOnly":true,"isTrigger":true,"orderType":"Stop Market","triggerPx":"47000","children":[]},
+            {"coin":"BTC","oid":4,"side":"B","sz":"0.01","reduceOnly":false,"isTrigger":false,"orderType":"Limit","limitPx":"49000","children":[],"tif":"Gtc"},
+            {"coin":"BTC","oid":5,"side":"B","sz":"0.01","reduceOnly":false,"isTrigger":false,"orderType":"Limit","limitPx":"49000","children":[{"oid":6}],"tif":"Gtc"}
+        ]);
+        apply_open_orders_for_symbols(&mut state, &rows, 100, 100, None, &["BTC"]).unwrap();
+        let orders = state
+            .orders_for("BTC")
+            .map(|order| &order.value)
+            .collect::<Vec<_>>();
+        assert_eq!(orders[0].kind, OrderKind::TrailingStop);
+        assert_eq!(orders[0].price, "52470".parse().unwrap());
+        assert_eq!(
+            orders[0].trailing.as_ref().unwrap().best,
+            Some("53000".parse().unwrap())
+        );
+        assert!(orders[0].cloid.is_none() && !orders[0].fast_cancel_eligible);
+        assert_eq!(orders[1].price, Decimal::ZERO);
+        assert_eq!(
+            orders[1].trailing.as_ref().unwrap().activation,
+            Some("48000".parse().unwrap())
+        );
+        assert_eq!(orders[2].kind, OrderKind::StopLoss);
+        assert!(orders[3].fast_cancel_eligible);
+        assert!(!orders[4].fast_cancel_eligible);
+        drop(orders);
+        let before = state.orders.clone();
+        for condition in [
+            "retracement 1%, best garbage",
+            "activation immediate, activation immediate, retracement 1%, best 53000",
+            "retracement 79228162514264337593543950335, best 50000",
+        ] {
+            let bad = json!([native(8, "B", condition)]);
+            assert!(
+                apply_open_orders_for_symbols(&mut state, &bad, 101, 101, None, &["BTC"]).is_err()
+            );
+            assert_eq!(
+                state.orders, before,
+                "malformed snapshot must not partially mutate order state"
+            );
+        }
+    }
 
     #[test]
     fn perp_metadata_requires_and_preserves_positive_max_leverage() {
