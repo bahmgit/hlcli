@@ -28,6 +28,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcRequest {
+    Trading { request: hl_wire::Request },
     Health,
     MarketSessionHealth { session_id: u64 },
     Status,
@@ -51,6 +52,7 @@ pub enum IpcRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum IpcResponse {
+    Trading(hl_wire::Response),
     Health(HealthPayload),
     Status(StatusPayload),
     Orders(OrdersPayload),
@@ -136,11 +138,12 @@ pub struct KeybindsPayload {
 
 #[derive(Clone)]
 pub struct IpcApp {
-    state: Arc<tokio::sync::RwLock<TradingState>>,
+    pub(crate) state: Arc<tokio::sync::RwLock<TradingState>>,
     metrics: Metrics,
-    queue: Arc<CommandQueue>,
+    pub(crate) queue: Arc<CommandQueue>,
     execution: ExecutionControl,
     action_connection: Option<ActionConnectionHealth>,
+    pub(crate) identity: Option<(String, Option<String>, bool)>,
 }
 
 impl IpcApp {
@@ -155,7 +158,18 @@ impl IpcApp {
             queue,
             execution: ExecutionControl::default(),
             action_connection: None,
+            identity: None,
         }
+    }
+
+    pub fn with_identity(
+        mut self,
+        network: String,
+        account: Option<String>,
+        read_only: bool,
+    ) -> Self {
+        self.identity = Some((network, account, read_only));
+        self
     }
 
     pub fn with_execution_control(mut self, execution: ExecutionControl) -> Self {
@@ -171,7 +185,7 @@ impl IpcApp {
         self
     }
 
-    async fn health_payload(
+    pub(crate) async fn health_payload(
         &self,
         active: String,
         readiness: crate::state::Readiness,
@@ -208,6 +222,9 @@ impl IpcApp {
 
     pub async fn dispatch(&self, request: IpcRequest) -> IpcResponse {
         match request {
+            IpcRequest::Trading { request } => {
+                IpcResponse::Trading(self.dispatch_trading(request).await)
+            }
             IpcRequest::Health => {
                 let state = self.state.read().await;
                 let readiness = readiness(&state);

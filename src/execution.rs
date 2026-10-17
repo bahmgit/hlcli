@@ -404,14 +404,16 @@ fn get_string<E: de::Error>(value: &serde_json::Value, keys: &[&str]) -> Result<
         .ok_or_else(|| E::custom(format!("missing one of {}", keys.join(", "))))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ExecutionStatus {
     Accepted,
     Rejected,
     Ambiguous,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct SubmitReceipt {
     pub id: u64,
     pub status: ExecutionStatus,

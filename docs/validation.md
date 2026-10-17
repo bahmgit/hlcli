@@ -29,7 +29,9 @@ mirror implementation or incidental output. Test count and coverage percentages 
 
 The suite covers typed grammar and aliases, planner action classes and invariants, journal-before-post,
 ambiguous acknowledgements, dependent protection, cancellation races, restart identity, account-source
-parity, HTTP authorization, encrypted credentials, real client/IPC/PTY behavior, and feed liveness.
+parity, HTTP authorization, encrypted credentials, real client/IPC/PTY behavior, and feed liveness. Identified native-client IPC tests use a real UDS connection to reproduce a lost
+submission reply, concurrent retries, payload conflicts, result eviction, fixed market targeting, and
+typed partial outcomes.
 
 ## Dependencies
 
@@ -40,11 +42,14 @@ Do not suppress a vulnerability without documenting its applicability and depend
 
 The current lockfile reports `RUSTSEC-2026-0235` for optional `rkyv 0.7.46` through `rust_decimal`.
 `cargo tree --locked -e features --target all -i rkyv` prints no dependency path: that package is
-not compiled with this manifest. The existing compiled `rustls 0.23.40` also reports `RUSTSEC-2026-0285`: TLS 1.3 handshake
-messages can be accepted across encryption-level boundaries. It enters both HTTPS and WebSocket
-paths through `reqwest` and `tokio-tungstenite`; upstream identifies `0.23.45` as patched.
-This feature change leaves dependencies unchanged; the advisory remains an outstanding release
-limitation. The lockfile also reports unmaintained `derivative`, `paste`, and
+not compiled with this manifest. The audit also reports five advisories for optional
+`quinn-proto 0.11.15`; `cargo tree --locked -e features --target all -i quinn-proto`
+likewise shows no compiled dependency path. The compiled TLS dependency was updated from `rustls 0.23.40` to patched `0.23.45`
+for `RUSTSEC-2026-0285`, with its compatible webpki/AWS-LC dependencies. The full deterministic
+gate passed after this update. The latest audit reports four newer Rustls advisories
+(RUSTSEC-2026-0346 through RUSTSEC-2026-0349), with 0.23.46 identified as patched;
+these remain an outstanding dependency limitation.
+The lockfile also reports unmaintained `derivative`, `paste`, and
 `proc-macro-error2`, plus yanked `bitcoin-io`/`bitcoin_hashes`. Of these, `paste` and
 `proc-macro-error2` participate in the current Alloy build; the others are optional and absent
 from the compiled graph. Retain the tested dependency set for this release and reassess upstream

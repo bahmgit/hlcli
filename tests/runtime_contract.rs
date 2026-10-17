@@ -231,7 +231,7 @@ async fn retained_scoped_job_finishes_after_session_close() {
         )
         .with_scopes(scopes.clone()),
     );
-    let queue = CommandQueue::new(service);
+    let queue = CommandQueue::new(service).unwrap();
     let session = queue.open_market_session("BTC".to_string()).await.unwrap();
     let submitted = queue
         .submit_scoped(session.session_id, "sleep 50ms; status".to_string())

@@ -169,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
-    let queue = CommandQueue::new(service);
+    let queue = CommandQueue::new(service)?;
     let server_queue = queue.clone();
     let ipc_path = args
         .ipc_path
@@ -178,7 +178,12 @@ async fn main() -> anyhow::Result<()> {
     let ipc_listener = ipc::bind(&ipc_path).await?;
     let ipc_app = IpcApp::new(state.clone(), metrics.clone(), queue)
         .with_execution_control(session.execution.clone())
-        .with_action_connection(session.action_connection.clone());
+        .with_action_connection(session.action_connection.clone())
+        .with_identity(
+            format!("{:?}", cfg.network),
+            session.user.clone(),
+            args.read_only,
+        );
     let http_app = server::router(
         AppState::from_shared_state(state, metrics, &cfg)
             .with_queue(server_queue)

@@ -1,0 +1,11 @@
+[package]
+name = "hl-wire"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+rust_decimal = { version = "1.39", features = ["serde-with-str"] }

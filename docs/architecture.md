@@ -76,3 +76,21 @@ false, including from the signed MessagePack encoding. Selection requires no syn
 - Credential encryption does not protect a compromised running process or exposed password.
 - Journals, profiles, configurations, and logs are sensitive operational records.
 - Exchange behavior is an external dependency and requires recertification when it changes.
+
+## Independent trading clients
+
+`crates/hl-wire` defines the versioned `trading` IPC envelope for independent trading clients.
+It contains only DTOs and exact decimal serialization, without signing or exchange dependencies.
+Hello returns protocol version, daemon instance, network, account, read-only status, and market metadata.
+Trading sessions have fixed markets. Identified submissions name that instance, session, exact market,
+and a positive consecutive session sequence. A retry with identical contents returns the same command ID;
+changed contents or retired sequences reject without execution. Sequence watermarks live in the session,
+so evicting the 200 retained command results cannot authorize replay. New identified submissions reject
+when the global queue has 256 queued/running commands. Legacy clients preserve their existing contracts.
+
+Daemon instances change on restart. The new API rejects old-instance submissions and result queries;
+there is no cross-restart retry guarantee. Clients must reconcile unresolved delivery rather than start
+a replacement submission. Structured command output retains all action receipts, per-order identities,
+partial failures, and expiring confirmations, including outcomes from sequential command chains.
+Scoped observations include timestamps, order readiness, fill-retention bounds, position, mark,
+balances, and native order/TWAP details. These reads do not run exchange refresh or enter the action path.

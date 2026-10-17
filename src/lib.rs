@@ -17,3 +17,5 @@ pub mod scope;
 pub mod security;
 pub mod server;
 pub mod state;
+
+mod trading_ipc;

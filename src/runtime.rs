@@ -36,6 +36,10 @@ pub struct CommandResponse {
     #[serde(default)]
     pub exit: bool,
     pub lines: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipts: Vec<SubmitReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<PendingConfirmationView>,
 }
 
 impl CommandResponse {
@@ -45,6 +49,8 @@ impl CommandResponse {
             clear: false,
             exit: false,
             lines: lines.into(),
+            receipts: Vec::new(),
+            confirmation: None,
         }
     }
 
@@ -54,6 +60,8 @@ impl CommandResponse {
             clear: false,
             exit: false,
             lines: vec![message.into()],
+            receipts: Vec::new(),
+            confirmation: None,
         }
     }
 
@@ -63,6 +71,8 @@ impl CommandResponse {
             clear: true,
             exit: false,
             lines: Vec::new(),
+            receipts: Vec::new(),
+            confirmation: None,
         }
     }
 
@@ -72,6 +82,8 @@ impl CommandResponse {
             clear: false,
             exit: true,
             lines: Vec::new(),
+            receipts: Vec::new(),
+            confirmation: None,
         }
     }
 
@@ -83,6 +95,8 @@ impl CommandResponse {
         }
         self.exit |= other.exit;
         self.lines.extend(other.lines);
+        self.receipts.extend(other.receipts);
+        self.confirmation = other.confirmation;
     }
 }
 
@@ -330,6 +344,14 @@ impl CommandService {
                 break;
             }
         }
+        if let Some(pending) = self.pending_confirmation(session_id).await {
+            out.confirmation = Some(PendingConfirmationView {
+                scope: session_id
+                    .map_or_else(|| "global".to_string(), |id| format!("marketSession:{id}")),
+                summary: pending.summary,
+                expires_at_ms: pending.expires_at_ms,
+            });
+        }
         out
     }
 
@@ -340,6 +362,21 @@ impl CommandService {
     pub async fn open_market_session(
         &self,
         requested: String,
+    ) -> Result<MarketSessionResponse, String> {
+        self.open_market_session_in(requested, false).await
+    }
+
+    pub async fn open_trading_session(
+        &self,
+        requested: String,
+    ) -> Result<MarketSessionResponse, String> {
+        self.open_market_session_in(requested, true).await
+    }
+
+    async fn open_market_session_in(
+        &self,
+        requested: String,
+        fixed: bool,
     ) -> Result<MarketSessionResponse, String> {
         let requested = requested.trim().to_ascii_uppercase();
         let symbol = self
@@ -357,7 +394,7 @@ impl CommandService {
             .scopes
             .as_ref()
             .ok_or_else(|| "market sessions unavailable".to_string())?;
-        let session_id = scopes.open(symbol.clone()).await;
+        let session_id = scopes.open_with_policy(symbol.clone(), fixed).await;
         if let Some(refresher) = &self.refresher
             && let Err(err) = refresher.refresh_market(&symbol).await
         {
@@ -808,6 +845,8 @@ impl CommandService {
             clear: false,
             exit: false,
             lines,
+            receipts: Vec::new(),
+            confirmation: None,
         }
     }
 
@@ -1184,7 +1223,7 @@ fn response_from_receipt(receipt: SubmitReceipt) -> CommandResponse {
         receipt.id, receipt.status
     )];
     lines.extend(receipt.statuses.iter().enumerate().map(render_order_status));
-    if let Some(error) = receipt.error {
+    if let Some(error) = &receipt.error {
         lines.push(format!("error={error}"));
     }
     CommandResponse {
@@ -1192,6 +1231,8 @@ fn response_from_receipt(receipt: SubmitReceipt) -> CommandResponse {
         clear: false,
         exit: false,
         lines,
+        receipts: vec![receipt],
+        confirmation: None,
     }
 }
 
@@ -1569,6 +1610,8 @@ pub struct CommandExecutionRecord {
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
     pub response: Option<CommandResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1599,6 +1642,7 @@ pub struct CommandPendingResponse {
 }
 
 pub struct CommandQueue {
+    instance_id: String,
     service: Arc<CommandService>,
     state: Mutex<QueueState>,
     notify: Notify,
@@ -1616,15 +1660,23 @@ struct QueueState {
 }
 
 impl CommandQueue {
-    pub fn new(service: Arc<CommandService>) -> Arc<Self> {
+    pub fn new(service: Arc<CommandService>) -> anyhow::Result<Arc<Self>> {
+        let mut instance = [0_u8; 16];
+        getrandom::fill(&mut instance)?;
+        let instance_id = instance.iter().map(|byte| format!("{byte:02x}")).collect();
         let queue = Arc::new(Self {
+            instance_id,
             service,
             state: Mutex::new(QueueState::default()),
             notify: Notify::new(),
             history_limit: 200,
         });
         tokio::spawn(queue.clone().worker());
-        queue
+        Ok(queue)
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     pub async fn submit(&self, command: String) -> CommandSubmitResponse {
@@ -1647,9 +1699,21 @@ impl CommandQueue {
 
     async fn enqueue(&self, command: String, session_id: Option<u64>) -> CommandSubmitResponse {
         let mut state = self.state.lock().await;
+        let response = Self::insert(&mut state, command, session_id, None);
+        drop(state);
+        self.notify.notify_one();
+        response
+    }
+
+    fn insert(
+        state: &mut QueueState,
+        command: String,
+        session_id: Option<u64>,
+        sequence: Option<u64>,
+    ) -> CommandSubmitResponse {
         state.next_id = state.next_id.saturating_add(1);
         let command_id = state.next_id;
-        let queued_ahead = queue_depth(&state);
+        let queued_ahead = queue_depth(state);
         let accepted_at_ms = now_ms();
         state.queue.push_back(command_id);
         if let Some(session_id) = session_id {
@@ -1665,18 +1729,73 @@ impl CommandQueue {
                 started_at_ms: None,
                 finished_at_ms: None,
                 response: None,
+                submission_sequence: sequence,
             },
         );
-        let response = CommandSubmitResponse {
+        CommandSubmitResponse {
             command_id,
             accepted_at_ms,
             queued_ahead,
-            queue_depth: queue_depth(&state),
+            queue_depth: queue_depth(state),
             running_command_id: state.running,
-        };
+        }
+    }
+
+    /// Retries reuse the exact sequence and command. Evicted results are rejected, never replayed.
+    pub async fn submit_identified(
+        &self,
+        session_id: u64,
+        sequence: u64,
+        market: &str,
+        command: String,
+    ) -> Result<CommandSubmitResponse, String> {
+        if command.is_empty() || command.len() > 65_536 {
+            return Err("command must contain 1..65536 bytes".to_string());
+        }
+        let scopes = self
+            .service
+            .scopes
+            .as_ref()
+            .ok_or("market sessions unavailable")?;
+        let mut state = self.state.lock().await;
+        let previous = scopes.submission_sequence(session_id, market).await?;
+        if sequence <= previous {
+            let record = state
+                .jobs
+                .values()
+                .find(|record| {
+                    record.submission_sequence == Some(sequence)
+                        && state.session_ids.get(&record.command_id) == Some(&session_id)
+                })
+                .ok_or("submission result retired; reconcile instead of resubmitting")?;
+            if record.command != command {
+                return Err("submission sequence reused with different command".to_string());
+            }
+            return Ok(CommandSubmitResponse {
+                command_id: record.command_id,
+                accepted_at_ms: record.submitted_at_ms,
+                queued_ahead: 0,
+                queue_depth: queue_depth(&state),
+                running_command_id: state.running,
+            });
+        }
+        if queue_depth(&state) >= 256 {
+            return Err("execution queue full".to_string());
+        }
+        scopes
+            .retain_identified_job(session_id, market, sequence)
+            .await?;
+        let response = Self::insert(&mut state, command, Some(session_id), Some(sequence));
         drop(state);
         self.notify.notify_one();
-        response
+        Ok(response)
+    }
+
+    pub async fn open_trading_session(
+        &self,
+        market: String,
+    ) -> Result<MarketSessionResponse, String> {
+        self.service.open_trading_session(market).await
     }
 
     pub async fn get(&self, command_id: u64) -> Option<CommandExecutionRecord> {

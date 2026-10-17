@@ -126,3 +126,14 @@ a protection gap. Place a new native trail explicitly after draining old work.
   another signer to bypass the halt.
 - Suspected key exposure: stop the daemon, revoke the API wallet through a trusted interface,
   and provision a replacement. See `SECURITY.md`.
+
+## Independent trading clients
+
+Independent applications connect to the same private socket as `hl` and obtain
+network/account identity from `hld` through the versioned trading IPC protocol.
+Clients submit commands to the daemon; signing keys and execution remain in `hld`.
+
+Identified submission retry is limited to the same daemon instance and live fixed market session.
+Retired results, expired sessions, and daemon restarts require explicit reconciliation of outstanding
+work. Closing a client does not cancel exchange orders or daemon-managed protection. Snapshot reads
+carry fill-retention bounds so clients can expose missed account history rather than infer fills.

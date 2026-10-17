@@ -20,6 +20,8 @@ struct Session {
     last_seen_ms: u64,
     jobs: u32,
     closed: bool,
+    fixed: bool,
+    submission_sequence: u64,
 }
 
 #[derive(Debug)]
@@ -58,6 +60,10 @@ impl ScopeRegistry {
     }
 
     pub async fn open(&self, symbol: String) -> u64 {
+        self.open_with_policy(symbol, false).await
+    }
+
+    pub async fn open_with_policy(&self, symbol: String, fixed: bool) -> u64 {
         let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().await;
         state.sessions.insert(
@@ -68,6 +74,8 @@ impl ScopeRegistry {
                 last_seen_ms: now_ms(),
                 jobs: 0,
                 closed: false,
+                fixed,
+                submission_sequence: 0,
             },
         );
         self.publish(&state);
@@ -106,6 +114,9 @@ impl ScopeRegistry {
     pub async fn switch(&self, id: u64, symbol: String) -> Result<(), String> {
         let mut state = self.state.lock().await;
         let session = session_mut(&mut state, id)?;
+        if session.fixed {
+            return Err("trading session market is fixed; open a new session".to_string());
+        }
         session.symbol = symbol;
         session.last_seen_ms = now_ms();
         self.publish(&state);
@@ -116,6 +127,32 @@ impl ScopeRegistry {
         let mut state = self.state.lock().await;
         let session = live_session_mut(&mut state, id)?;
         session.jobs = session.jobs.saturating_add(1);
+        session.last_seen_ms = now_ms();
+        Ok(())
+    }
+
+    pub async fn submission_sequence(&self, id: u64, market: &str) -> Result<u64, String> {
+        let mut state = self.state.lock().await;
+        let session = live_session_mut(&mut state, id)?;
+        validate_trading_session(session, market)?;
+        session.last_seen_ms = now_ms();
+        Ok(session.submission_sequence)
+    }
+
+    pub async fn retain_identified_job(
+        &self,
+        id: u64,
+        market: &str,
+        sequence: u64,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().await;
+        let session = live_session_mut(&mut state, id)?;
+        validate_trading_session(session, market)?;
+        if session.submission_sequence.checked_add(1) != Some(sequence) {
+            return Err("submission sequence must be consecutive and positive".to_string());
+        }
+        session.submission_sequence = sequence;
+        session.jobs += 1;
         session.last_seen_ms = now_ms();
         Ok(())
     }
@@ -208,6 +245,13 @@ impl ScopeRegistry {
         markets.extend(state.managed_symbols.iter().cloned());
         self.markets.send_replace(markets);
     }
+}
+
+fn validate_trading_session(session: &Session, market: &str) -> Result<(), String> {
+    if !session.fixed || session.symbol != market {
+        return Err("identified submission requires its exact fixed trading market".to_string());
+    }
+    Ok(())
 }
 
 fn live_session_mut(state: &mut ScopeState, id: u64) -> Result<&mut Session, String> {

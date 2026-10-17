@@ -87,7 +87,7 @@ async fn real_client_enforces_arity_health_exit_and_typed_quit() {
         )
         .with_scopes(ScopeRegistry::new("BTC".to_string()).unwrap()),
     );
-    let app = IpcApp::new(state, metrics.clone(), CommandQueue::new(service));
+    let app = IpcApp::new(state, metrics.clone(), CommandQueue::new(service).unwrap());
     let socket_for_server = socket.clone();
     let server = tokio::spawn(async move {
         ipc::serve(&socket_for_server, app, 1_048_576)
@@ -176,7 +176,11 @@ async fn interactive_shell_restores_the_exact_prior_terminal_state() {
         Arc::new(NoopExecutor),
         KeybindStore::load(dir.join("keybinds.json")).unwrap(),
     ));
-    let app = IpcApp::new(state, Metrics::default(), CommandQueue::new(service));
+    let app = IpcApp::new(
+        state,
+        Metrics::default(),
+        CommandQueue::new(service).unwrap(),
+    );
     let socket_for_server = socket.clone();
     let server = tokio::spawn(async move {
         ipc::serve(&socket_for_server, app, 1_048_576)
