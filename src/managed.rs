@@ -623,9 +623,87 @@ impl ManagedExecutor {
         Ok(())
     }
 
+    // Failed attachment must never retry automatically, but its ownership can end once
+    // fresh state proves there is no position, entry, or exit left to manage.
+    async fn retire_finished_degraded_protections(&self, symbol: &str) -> Result<(), String> {
+        if let Some(persistence) = &self.persistence
+            && persistence.execution.ensure_running().await.is_err()
+        {
+            return Ok(());
+        }
+        let state = self.state.read().await;
+        let now = now_ms();
+        let limits = FreshnessLimits::default();
+        if !state.orders_ready(symbol, now, limits.orders_ms)
+            || !state.position(symbol).is_some_and(|position| {
+                position.age_ms(now) <= limits.position_ms && position.value.flat()
+            })
+        {
+            return Ok(());
+        }
+        let mut pending = self.entry_protections.lock().await;
+        let before = pending.len();
+        pending.retain(|protection| {
+            if protection.symbol != symbol
+                || protection.next_attempt_ms != u64::MAX
+                || protection.entry_cancel_pending
+                || protection.filled_size() == Decimal::ZERO
+                || protection.entry_orders.iter().any(|entry| !entry.terminal)
+            {
+                return true;
+            }
+            let legs = [
+                protection.stop_loss.as_ref(),
+                protection.take_profit.as_ref(),
+                protection.trailing.as_ref(),
+            ];
+            // A missing trailing identity requires a definitive journal outcome.
+            if legs
+                .iter()
+                .flatten()
+                .flat_map(|leg| &leg.tranches)
+                .any(|tranche| {
+                    tranche.oid.is_none()
+                        && !state
+                            .recovered_trailing_placements
+                            .contains_key(&tranche.operation)
+                })
+            {
+                return true;
+            }
+            state.orders_for(symbol).any(|order| {
+                protection.entry_orders.iter().any(|entry| {
+                    entry.oid == Some(order.value.oid)
+                        || order.value.cloid.as_deref() == Some(entry.cloid.to_string().as_str())
+                }) || legs.iter().flatten().any(|leg| {
+                    leg.cloid.is_some_and(|cloid| {
+                        order.value.cloid.as_deref() == Some(cloid.to_string().as_str())
+                    }) || leg.tranches.iter().any(|tranche| {
+                        tranche.oid.or_else(|| {
+                            state
+                                .recovered_trailing_placements
+                                .get(&tranche.operation)
+                                .copied()
+                                .flatten()
+                        }) == Some(order.value.oid)
+                    })
+                })
+            })
+        });
+        let changed = pending.len() != before;
+        drop(pending);
+        drop(state);
+        if changed {
+            self.persist().await?;
+        }
+        Ok(())
+    }
+
     async fn store_pending_protection(&self, protection: EntryProtection) -> Result<(), String> {
         debug_assert!(!protection.is_empty());
         self.validate_attached_trailing(&protection).await?;
+        self.retire_finished_degraded_protections(&protection.symbol)
+            .await?;
         if self
             .entry_protections
             .lock()
@@ -649,6 +727,8 @@ impl ManagedExecutor {
         protection: EntryProtection,
     ) -> Result<(), String> {
         self.validate_attached_trailing(&protection).await?;
+        self.retire_finished_degraded_protections(&protection.symbol)
+            .await?;
         let cloid = active.cloid;
         if self
             .entry_protections
@@ -1257,6 +1337,15 @@ impl ManagedExecutor {
         let now = now_ms();
         let protections = self.entry_protections.lock().await.clone();
         for mut protection in protections {
+            if protection.next_attempt_ms == u64::MAX {
+                if let Err(err) = self
+                    .retire_finished_degraded_protections(&protection.symbol)
+                    .await
+                {
+                    eprintln!("{err}");
+                }
+                continue;
+            }
             if protection.next_attempt_ms > now {
                 continue;
             }

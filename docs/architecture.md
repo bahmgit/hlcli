@@ -51,6 +51,9 @@ If a native tranche ends before attachment work finishes, the daemon cancels the
 and retains surviving exits for the remaining position. It does not infer a fill from disappearance.
 If an increment cannot be protected, the daemon reports degraded protection and cancels the remaining
 entry. Unresolved delivery halts execution instead of attempting cancellation or retry.
+Disabled attachment intent is retired only when fresh state proves the position is flat, every
+owned entry is terminal, and no owned exit remains. Unidentified trailing submissions retain
+ownership until their journal outcome is known. Retirement never submits or retries an order.
 
 Native trails are reduce-only exchange orders driven by mark prices. Hyperliquid owns activation,
 watermarks, and execution; the daemon has no local ratchet or active-trail database. Startup queries

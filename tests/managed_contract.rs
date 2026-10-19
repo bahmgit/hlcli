@@ -1191,3 +1191,177 @@ async fn stale_position_stops_unfinished_trailing_entry_without_disarming_native
         1
     );
 }
+
+#[tokio::test]
+async fn degraded_attachment_releases_market_only_after_flat_and_orders_gone() {
+    let state = Arc::new(RwLock::new(ready_perp("0")));
+    let inner = Arc::new(RecordingPlanExecutor::new(state.clone()));
+    let managed = ManagedExecutor::spawn(state.clone(), inner.clone(), Duration::from_millis(5));
+    managed
+        .execute_command(command::parse("buy 0.02 at 49000 trail 1%"))
+        .await
+        .unwrap();
+    // An increment too small to protect disables attachment and cancels the entry.
+    record_fill(&state, 100, "0.00004", "0.00004", 180).await;
+    for _ in 0..200 {
+        if !state
+            .read()
+            .await
+            .orders_for("BTC")
+            .any(|o| o.value.kind == OrderKind::Limit)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !state
+            .read()
+            .await
+            .orders_for("BTC")
+            .any(|o| o.value.kind == OrderKind::Limit)
+    );
+    assert!(managed.switch_blocker("BTC").await.is_some());
+    // Closing the position must retire the disabled intent without resubmitting protection.
+    let now = now_ms();
+    state.write().await.apply_fill_position(
+        Position {
+            symbol: "BTC".into(),
+            size: Decimal::ZERO,
+            entry_price: None,
+            detail: None,
+        },
+        now,
+        now,
+    );
+    managed
+        .execute_command(command::parse("buy 0.02 at 48000 trail 1%"))
+        .await
+        .expect("flat completed degraded entry must not block the next entry");
+    assert_eq!(
+        inner
+            .plans
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| matches!(p.action, Action::Order(_)))
+            .count(),
+        2
+    );
+    assert!(
+        !inner
+            .plans
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| matches!(p.action, Action::TrailingStop(_)))
+    );
+}
+
+#[tokio::test]
+async fn persisted_degraded_attachment_retirement_requires_definitive_fresh_empty_state() {
+    use hl_v2::{execution::ExecutionControl, protocol::Cloid};
+    let id = Cloid::from_u128(991).unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "hlcli-degraded-{}-{}.json",
+        std::process::id(),
+        now_ms()
+    ));
+    let snapshot = serde_json::json!({
+        "version": 3, "chases": [], "entryProtections": [{
+            "id": id, "symbol": "BTC", "intendedIsBuy": true,
+            "entryOrders": [{"cloid":id, "oid":100, "receiptFilled":"0.001",
+                "feedFilled":"0", "seenFillTids":[], "terminal":true}],
+            "stopLoss":null, "takeProfit":null,
+            "trailing":{"value":"1%", "cloid":null, "size":"0", "tranches":[
+                {"operation":format!("attached_trail:{id}:0"), "size":"0.001", "oid":null}
+            ]}, "entryCancelPending":false, "nextAttemptMs":u64::MAX
+        }]
+    });
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let state = Arc::new(RwLock::new(ready_perp("0")));
+    let inner = Arc::new(RecordingPlanExecutor::new(state.clone()));
+    let managed = ManagedExecutor::spawn_persisted(
+        state.clone(),
+        inner.clone(),
+        Duration::from_millis(5),
+        path.clone(),
+        ExecutionControl::default(),
+    )
+    .await
+    .unwrap();
+    // Flat does not prove the outcome of an unidentified native submission.
+    assert!(
+        managed
+            .execute_command(command::parse("buy 0.02 at 48000 trail 1%"))
+            .await
+            .unwrap_err()
+            .contains("already active")
+    );
+    assert!(inner.plans.lock().unwrap().is_empty());
+    {
+        let mut state = state.write().await;
+        state.positions.get_mut("BTC").unwrap().local_ms = 1;
+        state
+            .recovered_trailing_placements
+            .insert(format!("attached_trail:{id}:0"), Some(101));
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        managed.switch_blocker("BTC").await.is_some(),
+        "stale flat position is insufficient"
+    );
+    {
+        let mut state = state.write().await;
+        let now = now_ms();
+        state.apply_resting_receipt(
+            Order {
+                symbol: "BTC".into(),
+                oid: 101,
+                cloid: None,
+                is_buy: false,
+                price: Decimal::ZERO,
+                size: dec("0.001"),
+                reduce_only: true,
+                kind: OrderKind::TrailingStop,
+                tif: None,
+                fast_cancel_eligible: false,
+                trailing: None,
+            },
+            now,
+            now,
+        );
+        state.positions.get_mut("BTC").unwrap().local_ms = now;
+    }
+    assert!(
+        managed
+            .execute_command(command::parse("buy 0.02 at 48000 trail 1%"))
+            .await
+            .unwrap_err()
+            .contains("already active"),
+        "recovered live exit must retain ownership"
+    );
+    state
+        .write()
+        .await
+        .apply_orders_snapshot("BTC", vec![], now_ms() + 1, None);
+    for _ in 0..200 {
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if managed.switch_blocker("BTC").await.is_none()
+            && persisted["entryProtections"] == serde_json::json!([])
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(managed.switch_blocker("BTC").await.is_none());
+    assert!(
+        inner.plans.lock().unwrap().is_empty(),
+        "retirement must send no exchange actions"
+    );
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(persisted["entryProtections"], serde_json::json!([]));
+    std::fs::remove_file(path).unwrap();
+}

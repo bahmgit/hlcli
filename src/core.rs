@@ -365,8 +365,8 @@ where
         self.apply_receipt(&plan.market, &action, &receipt, Some(position_baseline))
             .await;
         if plan.action_label.starts_with("attached_trail:")
-            && receipt.error.is_none()
-            && receipt.status != ExecutionStatus::Ambiguous
+            && (receipt.status == ExecutionStatus::Rejected
+                || (receipt.status == ExecutionStatus::Accepted && receipt.error.is_none()))
         {
             let oid = receipt.statuses.iter().find_map(|status| match status {
                 OrderStatus::Resting { oid, .. } => Some(*oid),

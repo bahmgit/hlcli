@@ -443,3 +443,41 @@ async fn malformed_native_ack_halts_and_pending_restart_never_guesses_ownership(
     assert!(restart.recover().await.is_err());
     fs::remove_file(path).unwrap();
 }
+
+#[tokio::test]
+async fn definitive_native_rejection_records_outcome_without_restart() {
+    let path = std::env::temp_dir().join(format!(
+        "hlcli-native-rejected-{}-{}.jsonl",
+        std::process::id(),
+        now_ms()
+    ));
+    let state = Arc::new(RwLock::new(ready_perp("0.02")));
+    let core = Core::from_shared_state(
+        state.clone(),
+        ActionJournal::new(&path),
+        signer(),
+        FakeTransport {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            response: Err(TransportError::Exchange("native order rejected".into())),
+        },
+        Chain::Mainnet,
+        Metrics::default(),
+    );
+    let mut plan = Planner::default()
+        .plan(&*state.read().await, command::parse("trail 1% size 0.01"))
+        .unwrap();
+    plan.action_label = "attached_trail:rejected:0".into();
+    let receipt = core.execute_plan(plan).await.unwrap();
+    assert_eq!(receipt.status, ExecutionStatus::Rejected);
+    assert!(receipt.error.is_some());
+    assert_eq!(
+        state
+            .read()
+            .await
+            .recovered_trailing_placements
+            .get("attached_trail:rejected:0"),
+        Some(&None)
+    );
+    assert!(!core.execution_control().health().await.halted);
+    fs::remove_file(path).unwrap();
+}
