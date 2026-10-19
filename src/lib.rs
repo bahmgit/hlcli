@@ -6,6 +6,7 @@ pub mod exchange;
 pub mod execution;
 pub mod feed;
 pub mod info;
+mod info_reads;
 pub mod ipc;
 pub mod managed;
 pub mod metrics;

@@ -101,3 +101,9 @@ a replacement submission. Structured command output retains all action receipts,
 partial failures, and expiring confirmations, including outcomes from sequential command chains.
 Scoped observations include timestamps, order readiness, fill-retention bounds, position, mark,
 balances, and native order/TWAP details. These reads do not run exchange refresh or enter the action path.
+
+Startup metadata uses aggregate perpetual metadata with DEX-index/namespace validation. Complete
+per-DEX open-order snapshots are collected over a temporary read-only WebSocket before publishing
+the initialized state; missing snapshots cannot be treated as empty. REST info clients share a
+network-specific rolling read budget within the process, with bounded 429 retries. These mechanisms
+are outside the action-signing and normal submit-to-ack path.

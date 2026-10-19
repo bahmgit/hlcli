@@ -45,6 +45,7 @@ name = "hl"
 path = "src/bin/hl.rs"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 libc = "0.2"
 tower = "0.5"
 

@@ -137,3 +137,23 @@ Identified submission retry is limited to the same daemon instance and live fixe
 Retired results, expired sessions, and daemon restarts require explicit reconciliation of outstanding
 work. Closing a client does not cancel exchange orders or daemon-managed protection. Snapshot reads
 carry fill-retention bounds so clients can expose missed account history rather than infer fills.
+
+### Discovery and read rate limits
+
+Both networks discover perpetuals with `perpDexs` and `allPerpMetas`, preserving exchange DEX
+and asset indices. A changed DEX list or mismatched symbol namespace fails initialization instead
+of guessing an asset ID. Spot discovery is unchanged.
+
+Initialization collects `openOrders` WebSocket snapshots for every discovered DEX, including
+DEXes without an open client pane. Every requested DEX must return an identity-checked snapshot
+(an empty order array counts); a missing, malformed, wrong-account or interrupted snapshot fails
+initialization. The snapshot socket closes before the normal streaming feed starts. Trading remains
+disabled until initialization and existing journal reconciliation succeed. Signing and action submission
+are unchanged.
+
+REST info reads share a per-network, process-local rolling budget of 1000 weight per minute,
+below the documented 1200/IP limit. HTTP 429 responses impose a shared cooldown of at least
+60 seconds; numeric Retry-After values up to 120 seconds are honored before at most two retries.
+Longer Retry-After values fail the current request without retrying. Other HTTP errors are not retried.
+Errors identify the info request type and DEX without logging account addresses. This budget cannot
+coordinate other processes, browser workers, devices or users sharing the same public IP.

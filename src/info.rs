@@ -509,22 +509,10 @@ impl InfoClient {
         &self,
         allowed_symbols: &BTreeSet<String>,
     ) -> anyhow::Result<(Vec<Market>, BTreeMap<u64, String>)> {
-        let mut markets = parse_markets(
-            &self.post(json!({ "type": "metaAndAssetCtxs" })).await?,
-            allowed_symbols,
-            None,
-        )?;
-        for dex in parse_perp_dexs(
-            &self.post(json!({ "type": "perpDexs" })).await?,
-            allowed_symbols,
-        )? {
-            let value = self
-                .post(json!({ "type": "metaAndAssetCtxs", "dex": dex.name.as_str() }))
-                .await?;
-            markets.extend(parse_markets(&value, allowed_symbols, Some(&dex))?);
-        }
-        let spots =
-            parse_spot_markets(&self.post(json!({ "type": "spotMetaAndAssetCtxs" })).await?)?;
+        let dex_value = self.post(json!({"type":"perpDexs"})).await?;
+        let metas = self.post(json!({"type":"allPerpMetas"})).await?;
+        let mut markets = parse_all_perp_metas(&dex_value, &metas, allowed_symbols)?;
+        let spots = parse_spot_markets(&self.post(json!({"type":"spotMetaAndAssetCtxs"})).await?)?;
         let (spot_markets, spot_price_wires) = select_spot_markets(spots, allowed_symbols);
         markets.extend(spot_markets);
         Ok((markets, spot_price_wires))
@@ -613,26 +601,15 @@ impl InfoClient {
         let dexes = state
             .markets
             .values()
-            .map(|market| market.dex.clone())
-            .collect::<BTreeSet<_>>();
-        for dex in dexes {
-            if dex == market.dex {
-                continue;
-            }
-            let request_ms = now_ms();
-            let orders = self
-                .post(user_scoped("frontendOpenOrders", user, dex.as_deref()))
-                .await?;
-            let symbols = symbols_in_dex(state, dex.as_deref());
+            .map(|market| market.dex.clone().unwrap_or_default())
+            .collect();
+        let request_ms = now_ms();
+        let snapshots = crate::info_reads::order_snapshots(self.network, user, dexes).await?;
+        for (dex, orders) in snapshots {
+            let dex = (!dex.is_empty()).then_some(dex.as_str());
+            let symbols = symbols_in_dex(state, dex);
             let refs = symbols.iter().map(String::as_str).collect::<Vec<_>>();
-            apply_open_orders_for_symbols(
-                state,
-                &orders,
-                now_ms(),
-                request_ms,
-                dex.as_deref(),
-                &refs,
-            )?;
+            apply_open_orders_for_symbols(state, &orders, now_ms(), request_ms, dex, &refs)?;
         }
         if let Some(active_asset) = active_asset {
             state.apply_active_asset(
@@ -646,15 +623,14 @@ impl InfoClient {
     }
 
     async fn post(&self, body: Value) -> anyhow::Result<Value> {
-        self.metrics.rest_call();
-        let response = self
-            .http
-            .post(self.info_url())
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(response.json().await?)
+        crate::info_reads::post(
+            &self.http,
+            self.network,
+            self.info_url(),
+            body,
+            &self.metrics,
+        )
+        .await
     }
 
     fn info_url(&self) -> &'static str {
@@ -854,6 +830,44 @@ struct SpotMarket {
     market: Market,
     base_token: u64,
     quote: String,
+}
+
+fn parse_all_perp_metas(
+    dex_value: &Value,
+    metas: &Value,
+    allowed: &BTreeSet<String>,
+) -> anyhow::Result<Vec<Market>> {
+    let rows = metas
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("allPerpMetas response must be array"))?;
+    let dex_rows = dex_value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("perpDexs response must be array"))?;
+    anyhow::ensure!(
+        !rows.is_empty() && rows.len() == dex_rows.len() && dex_rows[0].is_null(),
+        "perpDexs/allPerpMetas index mismatch; reconnect to rediscover"
+    );
+    let mut markets = parse_markets(&json!([rows[0]]), allowed, None)?;
+    for dex in parse_perp_dexs(dex_value, &BTreeSet::new())? {
+        let meta = &rows[dex.index as usize];
+        let universe = meta
+            .get("universe")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("allPerpMetas missing universe"))?;
+        anyhow::ensure!(
+            universe
+                .iter()
+                .all(|row| row
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name
+                        .split_once(':')
+                        .is_some_and(|(prefix, _)| prefix == dex.name))),
+            "allPerpMetas DEX namespace/index mismatch"
+        );
+        markets.extend(parse_markets(&json!([meta]), allowed, Some(&dex))?);
+    }
+    Ok(markets)
 }
 
 fn parse_perp_dexs(
@@ -1990,6 +2004,44 @@ mod contract_tests {
         )
         .unwrap();
         assert!(state.position("BTC").unwrap().value.flat());
+    }
+
+    #[test]
+    fn aggregate_discovery_preserves_indices_and_rejects_mismatched_namespaces() {
+        let dexes = json!([null, {"name":"first"}, {"name":"xyz"}]);
+        let meta = |name| json!({"universe":[{"name":name,"szDecimals":3,"maxLeverage":10,"isDelisted":true}],"marginTables":[]});
+        let metas = json!([meta("BTC"), meta("first:BTC"), meta("xyz:BTC")]);
+        let all = parse_all_perp_metas(&dexes, &metas, &BTreeSet::new()).unwrap();
+        assert_eq!(all.len(), 3);
+        for (index, dex) in [
+            None,
+            Some(PerpDex {
+                index: 1,
+                name: "first".into(),
+            }),
+            Some(PerpDex {
+                index: 2,
+                name: "xyz".into(),
+            }),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let old =
+                parse_markets(&json!([metas[index], []]), &BTreeSet::new(), dex.as_ref()).unwrap();
+            assert_eq!(
+                all[index], old[0],
+                "aggregate must preserve every market field"
+            );
+        }
+        let filtered =
+            parse_all_perp_metas(&dexes, &metas, &BTreeSet::from(["XYZ:BTC".into()])).unwrap();
+        assert_eq!(filtered, vec![all[2].clone()]);
+        let mut swapped = metas.clone();
+        swapped.as_array_mut().unwrap().swap(1, 2);
+        assert!(parse_all_perp_metas(&dexes, &swapped, &BTreeSet::new()).is_err());
+        assert!(parse_all_perp_metas(&json!([null]), &metas, &BTreeSet::new()).is_err());
+        assert!(parse_all_perp_metas(&json!([]), &json!([]), &BTreeSet::new()).is_err());
     }
 
     #[test]

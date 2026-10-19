@@ -103,3 +103,25 @@ The exchange endpoint reference says fast cancel currently has no additional eff
 recommends it. The implementation requests it for eligible batches but makes no measured latency
 claim. Deterministic fixtures prove serialization and local lifecycle contracts; exchange acceptance
 and live execution semantics still require the authorized bounded tests above.
+
+### Discovery acceptance
+
+The deterministic contracts verify aggregate/per-DEX market-field equivalence, retained asset indices
+under filtering, namespace/list mismatch rejection, weighted rolling read budgets, and bounded HTTP
+429 retries with a virtual clock. A local WebSocket server verifies exact subscriptions, out-of-order
+completion, wrong-user rejection, and failure when a DEX snapshot is missing. Snapshot fixtures retain
+large order IDs and native trailing-protection fields without transformation.
+
+Run the optional public read-only acceptance explicitly:
+
+```bash
+cargo test --locked --test discovery_live -- --ignored --nocapture
+```
+
+It initializes the full universe and all DEX order snapshots on mainnet and testnet for the zero
+address; it never signs or submits actions. On 2026-10-19, the implementation initialized 877 markets
+across 10 builder DEXes on mainnet in 3.5 seconds and 2301 markets across 272 builder DEXes on testnet
+in 6.9 seconds. Timings are samples, not guarantees. Separate public reads compared every market
+field consumed by the parser against the old endpoint for all 11 mainnet DEX entries and four
+representative testnet entries (native, first, middle, last). This does not certify live trading or
+nonempty real-account recovery; those semantics remain covered by deterministic order/protection tests.
