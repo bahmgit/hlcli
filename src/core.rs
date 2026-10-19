@@ -205,11 +205,12 @@ where
         validate_plan(&state, &plan)?;
         validate_perp_capacity(&state, &plan)?;
         let readiness = readiness(&state, &plan);
+        let position_baseline = PositionBaseline::capture(&state, &plan.market);
         drop(state);
         if !readiness.ready {
             return Err(readiness.reasons.join("; "));
         }
-        self.submit(plan).await
+        self.submit(plan, position_baseline).await
     }
 
     pub async fn execute_plan(&self, plan: ActionPlan) -> Result<SubmitReceipt, String> {
@@ -220,14 +221,19 @@ where
         validate_plan(&state, &plan)?;
         validate_perp_capacity(&state, &plan)?;
         let readiness = readiness(&state, &plan);
+        let position_baseline = PositionBaseline::capture(&state, &plan.market);
         drop(state);
         if !readiness.ready {
             return Err(readiness.reasons.join("; "));
         }
-        self.submit(plan).await
+        self.submit(plan, position_baseline).await
     }
 
-    async fn submit(&self, plan: ActionPlan) -> Result<SubmitReceipt, String> {
+    async fn submit(
+        &self,
+        plan: ActionPlan,
+        position_baseline: PositionBaseline,
+    ) -> Result<SubmitReceipt, String> {
         let before = self.metrics.snapshot();
         let nonce = self.next_nonce();
         let action = plan.action.clone();
@@ -356,7 +362,8 @@ where
                 ))
                 .await;
         }
-        self.apply_receipt(&plan.market, &action, &receipt).await;
+        self.apply_receipt(&plan.market, &action, &receipt, Some(position_baseline))
+            .await;
         if plan.action_label.starts_with("attached_trail:")
             && receipt.error.is_none()
             && receipt.status != ExecutionStatus::Ambiguous
@@ -503,7 +510,8 @@ where
                 self.execution_control.halt(reason.clone()).await;
                 return Err(reason);
             }
-            self.apply_receipt(&record.market, &action, &receipt).await;
+            self.apply_receipt(&record.market, &action, &receipt, None)
+                .await;
             self.record_recovered_order_outcomes(&action, &receipt)
                 .await;
         }
@@ -519,7 +527,13 @@ where
         result
     }
 
-    async fn apply_receipt(&self, market: &str, action: &Action, receipt: &SubmitReceipt) {
+    async fn apply_receipt(
+        &self,
+        market: &str,
+        action: &Action,
+        receipt: &SubmitReceipt,
+        position_baseline: Option<PositionBaseline>,
+    ) {
         if receipt.error.is_some() {
             return;
         }
@@ -555,9 +569,18 @@ where
                 }
             }
             Action::Order(batch) => {
+                if let Some(baseline) = position_baseline {
+                    apply_filled_position(
+                        &mut state,
+                        market,
+                        &batch.orders,
+                        &receipt.statuses,
+                        baseline,
+                        now,
+                    );
+                }
                 for (request, status) in batch.orders.iter().zip(&receipt.statuses) {
                     apply_order_status(&mut state, market, request, status, now);
-                    apply_fill_position(&mut state, market, request, status, now);
                 }
             }
             Action::Cancel(batch) => {
@@ -846,54 +869,84 @@ fn validate_response_statuses(
     Ok(statuses)
 }
 
-fn apply_fill_position(
+// A fill acknowledgement is a delta, not an authoritative position snapshot.
+// Anchor it before sending; never add it to a feed value received while awaiting the ack.
+struct PositionBaseline {
+    revision: u64,
+    position: Option<Position>,
+}
+
+impl PositionBaseline {
+    fn capture(state: &TradingState, market: &str) -> Self {
+        Self {
+            revision: state.position_revision(market),
+            position: state
+                .position(market)
+                .map(|position| position.value.clone()),
+        }
+    }
+}
+
+fn apply_filled_position(
     state: &mut TradingState,
     market: &str,
-    request: &OrderRequest,
-    status: &OrderStatus,
+    requests: &[OrderRequest],
+    statuses: &[OrderStatus],
+    baseline: PositionBaseline,
     now: u64,
 ) {
-    let OrderStatus::Filled {
-        total_size,
-        average_price,
-        ..
-    } = status
-    else {
+    let Some(mut expected) = baseline.position else {
         return;
     };
-    let Ok(size) = total_size.parse::<Decimal>() else {
+    let mut filled = false;
+    for (request, status) in requests.iter().zip(statuses) {
+        let OrderStatus::Filled {
+            total_size,
+            average_price,
+            ..
+        } = status
+        else {
+            continue;
+        };
+        let (Ok(size), Ok(price)) = (
+            total_size.parse::<Decimal>(),
+            average_price.parse::<Decimal>(),
+        ) else {
+            continue;
+        };
+        filled = true;
+        let next_size = (expected.size + if request.is_buy { size } else { -size }).normalize();
+        expected.entry_price = if next_size == Decimal::ZERO {
+            None
+        } else if expected.size == Decimal::ZERO
+            || (expected.size < Decimal::ZERO) != (next_size < Decimal::ZERO)
+            || next_size.abs() > expected.size.abs()
+        {
+            Some(price)
+        } else {
+            expected.entry_price
+        };
+        expected.size = next_size;
+        expected.detail = None;
+    }
+    if !filled {
         return;
-    };
-    let Ok(fill_price) = average_price.parse::<Decimal>() else {
-        return;
-    };
-    let current = state
-        .positions
-        .get(market)
-        .map(|position| position.value.clone())
-        .unwrap_or_else(|| Position::empty(market));
-    let delta = if request.is_buy { size } else { -size };
-    let next_size = (current.size + delta).normalize();
-    let entry_price = if next_size == Decimal::ZERO {
-        None
-    } else if current.size == Decimal::ZERO
-        || (current.size < Decimal::ZERO) != (next_size < Decimal::ZERO)
-        || next_size.abs() > current.size.abs()
+    }
+    if state.position_revision(market) == baseline.revision {
+        state.apply_fill_position(expected, now, now);
+    } else if state
+        .position(market)
+        .is_none_or(|position| position.value.size != expected.size)
     {
-        Some(fill_price)
+        // A concurrent snapshot may predate this fill or include other fills. Neither
+        // adding the delta nor replacing it with our estimate is safe. Await a fresh
+        // authoritative snapshot; dependent execution fails clearly in the meantime.
+        state.invalidate_position(market, now);
     } else {
-        current.entry_price
-    };
-    state.apply_fill_position(
-        Position {
-            symbol: market.to_string(),
-            size: next_size,
-            entry_price,
-            detail: None,
-        },
-        now,
-        now,
-    );
+        state.confirm_position_snapshot(market, now);
+    }
+    // A concurrent snapshot agreeing with the result already includes the delta.
+    // Preserve its authoritative entry price, detail and exchange timestamp.
 }
 
 fn accepted(receipt: &SubmitReceipt) -> bool {

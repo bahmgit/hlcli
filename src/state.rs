@@ -373,6 +373,8 @@ pub struct TradingState {
     pub recovered_order_outcomes: BTreeMap<String, RecoveredOrderOutcome>,
     pub fill_session_start_ms: u64,
     position_floor_ms: BTreeMap<String, u64>,
+    #[serde(skip)]
+    position_revisions: BTreeMap<String, u64>,
     order_floor_ms: BTreeMap<String, u64>,
     fill_seq: u64,
     fill_seen: HashSet<u64>,
@@ -403,6 +405,7 @@ impl TradingState {
             recovered_order_outcomes: BTreeMap::new(),
             fill_session_start_ms: 0,
             position_floor_ms: BTreeMap::new(),
+            position_revisions: BTreeMap::new(),
             order_floor_ms: BTreeMap::new(),
             fill_seq: 0,
             fill_seen: HashSet::new(),
@@ -555,6 +558,10 @@ impl TradingState {
                 order.value.symbol != position.symbol || order.value.oid < LOCAL_ORDER_OID_MIN
             });
         }
+        *self
+            .position_revisions
+            .entry(position.symbol.clone())
+            .or_default() += 1;
         self.positions.insert(
             position.symbol.clone(),
             Fresh {
@@ -589,8 +596,27 @@ impl TradingState {
             .cloned()
             .collect();
         for symbol in closed {
+            *self.position_revisions.entry(symbol.clone()).or_default() += 1;
             self.positions.remove(&symbol);
         }
+    }
+
+    pub(crate) fn position_revision(&self, symbol: &str) -> u64 {
+        self.position_revisions.get(symbol).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn confirm_position_snapshot(&mut self, symbol: &str, now: u64) {
+        if let Some(position) = self.positions.get(symbol) {
+            let time = position.exchange_ms.unwrap_or(now);
+            let floor = self.position_floor_ms.entry(symbol.into()).or_default();
+            *floor = (*floor).max(time);
+        }
+    }
+
+    pub(crate) fn invalidate_position(&mut self, symbol: &str, now: u64) {
+        self.positions.remove(symbol);
+        self.position_floor_ms.insert(symbol.into(), now);
+        *self.position_revisions.entry(symbol.into()).or_default() += 1;
     }
 
     pub fn apply_fill_position(&mut self, position: Position, local_ms: u64, exchange_ms: u64) {
@@ -609,6 +635,10 @@ impl TradingState {
                 order.value.symbol != position.symbol || order.value.oid < LOCAL_ORDER_OID_MIN
             });
         }
+        *self
+            .position_revisions
+            .entry(position.symbol.clone())
+            .or_default() += 1;
         self.positions.insert(
             position.symbol.clone(),
             Fresh {

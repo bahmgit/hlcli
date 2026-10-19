@@ -35,7 +35,11 @@ exchange queries and context-bearing journal records; legacy context-free record
 One `TradingState` combines subscriptions and authoritative snapshots with timestamps and explicit
 known/fresh flags. Trading validates relevant market, account, order, book, capacity, and position
 state. Position reconciliation uses the clearinghouse snapshot time when supplied, so an older
-snapshot cannot erase a newer acknowledged fill. Spot inventory is represented by balances, never perp positions. Full-DEX reconciliation
+snapshot cannot erase a newer acknowledged fill. Fill receipts use the position captured before
+submission, never a delta applied to a concurrently updated cache. A concurrent snapshot agreeing
+with the expected position is retained with its authoritative details; a conflicting snapshot
+invalidates position readiness until a fresh snapshot arrives. Restart reconciliation never replays
+historical fill quantities into current positions. Spot inventory is represented by balances, never perp positions. Full-DEX reconciliation
 updates every relevant configured/watched market atomically. Application ping/pong bounds feed
 liveness even when books are quiet; a missed pong retires the connection.
 
